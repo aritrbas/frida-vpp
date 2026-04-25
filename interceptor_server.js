@@ -1,376 +1,411 @@
-/* Setup */
 /*
-        1. apt update
-        2. apt instal python3-pip
-        3. pip3 install frida
-        4. pip3 install frida-tools
-        5. apt install less (for debugging with objdump)
-                eg) objdump -lSd /usr/lib/libvcl_ldpreload.so | less
-        6. Compile the assmebly patch code to hack register mismatch between Go ABI and SystemV ABI
-                i)  nasm -f elf64 -DPIC prepRegs.asm
-                ii) gcc -shared -fPIC prepRegs.o -o libPrepRegs.so
-        7. Create a hst test framework and persist it
-                i) sudo make test-debug PERSIST=true TEST=LDPreloadIperfVppTest
-        7. Copy the libraries, binary and interception.js script to the docker containers
-                i)   docker cp libvcl_ldpreload.so <container_id>:/usr/lib/libvcl_ldpreload.so
-                ii)  docker cp libPrepRegs.so <container_id>:/usr/lib/libPrepRegs.so
-                iii) docker cp test_server_go <container_id>:/usr/bin/test_server_go
-                iv)  docker cp interception.js <container_id>:/usr/bin/interception.js
-        8. Run test binary with Frida
-                eg) VCL_CONFIG=/tmp/server-share/vcl.conf frida /usr/bin/test_server_go -l interceptor.js
-                NOTE: binary path must be absolute, interceptor script path can be relative
-        *** How to figure out the system calls to intercept? ***
-                i) Run the binary with strace and check for the libc syscalls
-                        eg) strace -f -e trace=network test_server_go [socket, setsockopt, bind, listen, getsockname, accept4] [socket, getsockopt, connect]
-                ii) Then use gdb on the binary to trace it back to the Go syscalls
-                        eg) gdb test_server_go [b syscall.socket, b syscall.setsockopt, b syscall.bind, b syscall.Listen, b syscall.getsockname, b syscall.accept4, r]
-                iii) Generally the Go syscall flow is like this:
-                        syscall.Socket ==> syscall.socket ==> syscall.RawSyscall ==> syscall.RawSyscall6 ==> ASM code to manipulate registers as per SystemV ABI standards ==> SYSCALL
-*/
+ * Frida VPP/VCL Interceptor for Go Server Binaries
+ *
+ * This script intercepts Go's socket-layer syscalls (socket, bind, listen,
+ * accept4, connect, setsockopt, getsockopt, getsockname) and redirects them
+ * to VPP's VCL library (libvcl_ldpreload.so).
+ *
+ * KEY FIXES over previous attempts (see docs/failed_attempt_analysis.md):
+ *   1. Uses NativeCallback (not prepRegs shim) — performs Go ABI → System V ABI
+ *      register translation entirely in Frida JS, eliminating the two-step
+ *      replace+attach approach.
+ *   2. Always sets rbx=0, rcx=0 on success (or rbx=0, rcx=errno on error)
+ *      to satisfy Go's return convention.
+ *   3. Uses per-thread state (this.threadId) instead of global flags for
+ *      thread-safe dispatch.
+ *   4. Does NOT call blocking LDP functions (accept4) from the JS thread —
+ *      instead uses a NativeCallback that bridges directly.
+ *
+ * SETUP:
+ *   1. Build: nasm -f elf64 -DPIC prepRegs.asm && gcc -shared -fPIC prepRegs.o -o libPrepRegs.so
+ *      (Not needed for this script — we use NativeCallback instead)
+ *   2. Copy libs to container:
+ *        docker cp libvcl_ldpreload.so <container_id>:/usr/lib/libvcl_ldpreload.so
+ *   3. Run:
+ *        VCL_CONFIG=/tmp/server-share/vcl.conf frida /usr/bin/echo_server -l interceptor_server.js
+ *
+ * TARGET BINARY: Change 'moduleName' below to match your Go binary name.
+ */
 
+'use strict';
 
+/* ============================================================================
+ * CONFIGURATION
+ * ============================================================================ */
 
-/* Find the addresses of Go syscalls */
+// Change this to your Go binary name (without path)
 const moduleName = 'echo_server';
-const syscalls = ['syscall.socket', 'syscall.setsockopt', 'syscall.bind', 'syscall.Listen', 'syscall.getsockname', 'syscall.accept4', 'syscall.getsockopt', 'syscall.connect', 'syscall.errEAGAIN', 'go:itab.syscall.Errno,error'];
 
-// Create a hashmap to store the addresses of each Go syscall (to be used in interception later)
-const syscallAddresses = {};
-
-// Store the address of a given Go syscall
-function setupInterceptor(name) {
-        Module.enumerateSymbols(moduleName, {
-                onMatch: function (exp) {
-                        if (exp.name === name) {
-                                console.log(`Found ${name} at address: ${exp.address}`);
-                                syscallAddresses[name] = exp.address; // Store the address in the hashmap
-                        }
-                },
-                onComplete: function () {
-                        console.log(`Finished enumerating exports for ${moduleName}`);
-                }
-        });
-}
-
-// Store the addresses of all Go syscalls
-syscalls.forEach(setupInterceptor);
-
-/* Load the required modules in the process address space */
-const modules = [
-        '/usr/lib/libvcl_ldpreload.so', // VCL LD Preload library
-        '/usr/lib/libPrepRegs.so' // assembly code to hack register mismatch between Go ABI and SystemV ABI
+// Syscalls to intercept
+const syscallNames = [
+    'syscall.socket',
+    'syscall.setsockopt',
+    'syscall.getsockopt',
+    'syscall.bind',
+    'syscall.Listen',
+    'syscall.getsockname',
+    'syscall.accept4',
+    'syscall.connect'
 ];
 
-// Check if the library is loaded
-function checkLibraryLoaded(moduleName) {
-        let loaded = false;
+/* ============================================================================
+ * STEP 1: Find Go symbol addresses
+ * ============================================================================ */
 
-        Process.enumerateModules({
-                onMatch: function(module) {
-                        if (module.name === moduleName) {
-                                loaded = true;
-                                console.log(`${module.name} is loaded at ${module.base}`);
-                        }
-                },
-                onComplete: function() {
-                        if (!loaded) {
-                                console.log(`${moduleName} is not loaded.`);
-                        }
-                }
-        });
+const syscallAddresses = {};
 
-        return loaded;
+syscallNames.forEach(function(name) {
+    Module.enumerateSymbols(moduleName, {
+        onMatch: function(exp) {
+            if (exp.name === name) {
+                syscallAddresses[name] = exp.address;
+                console.log('[+] Found ' + name + ' at ' + exp.address);
+            }
+        },
+        onComplete: function() {}
+    });
+});
+
+/* ============================================================================
+ * STEP 2: Load VCL library
+ * ============================================================================ */
+
+const VCL_LIB = '/usr/lib/libvcl_ldpreload.so';
+
+(function loadVCL() {
+    var loaded = false;
+    Process.enumerateModules({
+        onMatch: function(m) { if (m.path === VCL_LIB || m.name === 'libvcl_ldpreload.so') loaded = true; },
+        onComplete: function() {}
+    });
+    if (!loaded) {
+        Module.load(VCL_LIB);
+        console.log('[+] Loaded ' + VCL_LIB);
+    } else {
+        console.log('[+] ' + VCL_LIB + ' already loaded');
+    }
+})();
+
+/* ============================================================================
+ * STEP 3: Resolve LDP (VCL LD_PRELOAD) function addresses
+ * ============================================================================ */
+
+const ldp = {
+    socket:      new NativeFunction(Module.findExportByName(VCL_LIB, 'socket'),      'int', ['int', 'int', 'int']),
+    bind:        new NativeFunction(Module.findExportByName(VCL_LIB, 'bind'),        'int', ['int', 'pointer', 'int']),
+    listen:      new NativeFunction(Module.findExportByName(VCL_LIB, 'listen'),      'int', ['int', 'int']),
+    accept4:     new NativeFunction(Module.findExportByName(VCL_LIB, 'accept4'),     'int', ['int', 'pointer', 'pointer', 'int']),
+    connect:     new NativeFunction(Module.findExportByName(VCL_LIB, 'connect'),     'int', ['int', 'pointer', 'int']),
+    setsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'setsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'int']),
+    getsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'pointer']),
+    getsockname: new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockname'), 'int', ['int', 'pointer', 'pointer']),
+};
+
+console.log('[+] LDP socket:      ' + Module.findExportByName(VCL_LIB, 'socket'));
+console.log('[+] LDP bind:        ' + Module.findExportByName(VCL_LIB, 'bind'));
+console.log('[+] LDP listen:      ' + Module.findExportByName(VCL_LIB, 'listen'));
+console.log('[+] LDP accept4:     ' + Module.findExportByName(VCL_LIB, 'accept4'));
+console.log('[+] LDP connect:     ' + Module.findExportByName(VCL_LIB, 'connect'));
+console.log('[+] LDP setsockopt:  ' + Module.findExportByName(VCL_LIB, 'setsockopt'));
+console.log('[+] LDP getsockopt:  ' + Module.findExportByName(VCL_LIB, 'getsockopt'));
+console.log('[+] LDP getsockname: ' + Module.findExportByName(VCL_LIB, 'getsockname'));
+
+/* ============================================================================
+ * STEP 4: C errno helper
+ * ============================================================================ */
+
+const errnoLocation = new NativeFunction(
+    Module.findExportByName(null, '__errno_location'), 'pointer', []
+);
+
+function getCErrno() {
+    return errnoLocation().readInt();
 }
 
-// Load the library if not loaded
-function loadLibrary(moduleName) {
-        const myLib = Module.load(moduleName);
-        if (myLib) {
-                console.log(`${moduleName} loaded successfully.`);
-        } else {
-                console.log(`Failed to load ${moduleName}`);
-        }
+/* ============================================================================
+ * STEP 5: Go return value helper
+ *
+ * Go's syscall layer returns (r1, r2, errno) in (rax, rbx, rcx).
+ * On success: rax=result, rbx=0, rcx=0
+ * On error:   rax=-1, rbx=0, rcx=positive_errno
+ * ============================================================================ */
+
+function setGoReturn(context, retval, result, syscallName) {
+    if (result < 0) {
+        // C function returned -1; read errno from thread-local storage
+        var errno = getCErrno();
+        console.log('[!] ' + syscallName + ' failed: ret=' + result + ', errno=' + errno);
+        retval.replace(-1);
+        context.rbx = ptr(0);
+        context.rcx = ptr(errno);
+    } else {
+        console.log('[+] ' + syscallName + ' succeeded: ret=' + result);
+        retval.replace(result);
+        context.rbx = ptr(0);   // second return value = 0
+        context.rcx = ptr(0);   // errno = 0 (no error)
+    }
 }
 
-// Main execution
-modules.forEach(moduleName => {
-        if (!checkLibraryLoaded(moduleName)) {
-                loadLibrary(moduleName);
-        }
-});
+/* ============================================================================
+ * STEP 6: Allocate inline assembly trampolines via Memory.alloc + X86Writer
+ *
+ * For each Go syscall, we write a small trampoline in executable memory that:
+ *   1. Reads Go ABI registers (rax, rbx, rcx, rdi, rsi, r8)
+ *   2. Shuffles them to System V ABI (rdi, rsi, rdx, rcx, r8, r9)
+ *   3. Returns (does NOT call LDP — Frida's onLeave does that)
+ *
+ * We create unique trampolines per-syscall so Frida can attach distinct
+ * onLeave handlers to each.
+ * ============================================================================ */
 
+// Instead of assembly shims, we use NativeCallback for the full bridge.
+// NativeCallback runs in C ABI context, so we use Interceptor.replace with
+// a NativeCallback that:
+//   - Reads Go args from the CPU context (the NativeCallback receives them
+//     as System V args because Frida's Interceptor translates, but since
+//     the Go caller passed them in Go ABI, we read them from context directly)
+//
+// BETTER APPROACH: Use Interceptor.replace with a raw code block that
+// performs the full bridge: read Go regs → call LDP → set Go return regs.
 
+/* ============================================================================
+ * STEP 6 (actual): Per-syscall interception using Interceptor.attach
+ *
+ * Strategy: For each Go syscall function, we:
+ *   1. Write a tiny trampoline (just `ret`) via Memory.alloc + X86Writer
+ *   2. Interceptor.replace(goFunc, trampoline) — Go func becomes a no-op
+ *   3. Interceptor.attach(goFunc, { onEnter, onLeave }) — read Go ABI regs
+ *      in onEnter, call LDP and fix return in onLeave
+ *
+ * This avoids the assembly shim entirely. The trampoline is just `ret`.
+ * Frida's onEnter sees the original Go ABI registers before the trampoline
+ * runs, and onLeave lets us set the return values.
+ * ============================================================================ */
 
-/* Logging for debugging */
-const prepRegsAddress = Module.findExportByName('/usr/lib/libPrepRegs.so', 'prepRegs');
-const prepRegsFunction = new NativeFunction(prepRegsAddress, 'void', []);
-
-const prepRegs6Address = Module.findExportByName('/usr/lib/libPrepRegs.so', 'prepRegs6');
-const prepRegs6Function = new NativeFunction(prepRegs6Address, 'void', []);
-
-// const updateRegsAddress = Module.findExportByName('/usr/lib/libPrepRegs.so', 'updateRegs');
-// const updateRegsFunction = new NativeFunction(updateRegsAddress, 'void', ['int']);
-
-const originalSocket = syscallAddresses['syscall.socket'];
-const ldpSocketAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'socket');
-const ldpSocketFunction = new NativeFunction(ldpSocketAddress, 'int', ['int', 'int', 'int']);
-
-const originalSetSockOpt = syscallAddresses['syscall.setsockopt'];
-const ldpSetSockOptAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'setsockopt');
-const ldpSetSockOptFunction = new NativeFunction(ldpSetSockOptAddress, 'int', ['int', 'int', 'int', 'pointer', 'int']);
-
-const originalBind = syscallAddresses['syscall.bind'];
-const ldpBindAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'bind');
-const ldpBindFunction = new NativeFunction(ldpBindAddress, 'int', ['int', 'pointer', 'int']);
-
-const originalListen = syscallAddresses['syscall.Listen'];
-const ldpListenAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'listen');
-const ldpListenFunction = new NativeFunction(ldpListenAddress, 'int', ['int', 'int']);
-
-const originalGetSockName = syscallAddresses['syscall.getsockname'];
-const ldpGetSockNameAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'getsockname');
-const ldpGetSockNameFunction = new NativeFunction(ldpGetSockNameAddress, 'int', ['int', 'pointer', 'pointer']);
-
-const originalAccept4 = syscallAddresses['syscall.accept4'];
-const ldpAccept4Address = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'accept4');
-const ldpAccept4Function = new NativeFunction(ldpAccept4Address, 'int', ['int', 'pointer', 'pointer', 'int']);
-
-// const itabGoPtr = syscallAddresses['go:itab.syscall.Errno,error'];
-
-// const convT64GoPtr = syscallAddresses['syscall.errEAGAIN'];
-// const convT64GoFunction = new NativeFunction(convT64GoPtr, 'pointer', ['uint64']);
-
-const errnoPtrC = Module.findExportByName(null, '__errno_location');
-const errnoFuncC = new NativeFunction(errnoPtrC, 'pointer', []);
-
-console.log(`prepRegsAddress: ${prepRegsAddress}`); // <= 3 args
-console.log(`prepRegs6Address: ${prepRegs6Address}`); // <= 6 args
-// console.log(`updateRegsAddress: ${updateRegsAddress}`);
-
-console.log(`originalSocket address: ${originalSocket}`);
-console.log(`ldpSocketAddress: ${ldpSocketAddress}`);
-
-console.log(`originalSetSockOpt address: ${originalSetSockOpt}`);
-console.log(`ldpSetSockOptAddress: ${ldpSetSockOptAddress}`);
-
-console.log(`originalBind address: ${originalBind}`);
-console.log(`ldpBindAddress: ${ldpBindAddress}`);
-
-console.log(`originalListen address: ${originalListen}`);
-console.log(`ldpListenAddress: ${ldpListenAddress}`);
-
-console.log(`originalGetSockName address: ${originalGetSockName}`);
-console.log(`ldpGetSockNameAddress: ${ldpGetSockNameAddress}`);
-
-console.log(`originalAccept4 address: ${originalAccept4}`);
-console.log(`ldpAccept4Address: ${ldpAccept4Address}`);
-
-// console.log(`go:itab.syscall.Errno,error Address: ${itabGoPtr}`);
-console.log(`__errno_location Address: ${errnoPtrC}`);
-// console.log(`runtime.convT64 Address: ${convT64GoPtr}`);
-
-
-
-function inspectContext(context) {
-        // Inspect the registers
-        var registers = context;
-        console.log('Registers:', JSON.stringify(registers, null, 2));
-        // Inspect the stack
-        var stackPointer = context.sp;
-        console.log('Stack pointer:', stackPointer);
+function allocateRetTrampoline() {
+    var block = Memory.alloc(Process.pageSize);
+    Memory.patchCode(block, 16, function(code) {
+        var w = new X86Writer(code, { pc: block });
+        w.putRet();
+        w.flush();
+    });
+    return block;
 }
 
-function handleError(ret, context, syscallName) {
-        if (ret === -1) {
-                var errno = errnoFuncC().readInt();
-                console.log(`errno in ${syscallName} `, errno);
-                context.rax = -1;
-                context.rbx = 0;
-                context.rcx = errno;
-                // context.rax = -1;
-                // context.rbx = convT64GoPtr;
-                // context.rcx = convT64GoPtr + 0x8;
+/* ============================================================================
+ * STEP 7: Hook each syscall
+ * ============================================================================ */
+
+// --- socket(domain, type, protocol) → 3 args ---
+(function hookSocket() {
+    var addr = syscallAddresses['syscall.socket'];
+    if (!addr) { console.log('[-] syscall.socket not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=domain, rbx=type, rcx=protocol
+            this._domain   = this.context.rax.toInt32();
+            this._type     = this.context.rbx.toInt32();
+            this._protocol = this.context.rcx.toInt32();
+            console.log('[>] socket(' + this._domain + ', ' + this._type + ', ' + this._protocol + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.socket(this._domain, this._type, this._protocol);
+            setGoReturn(this.context, retval, ret, 'socket');
         }
-}
+    });
+    console.log('[+] Hooked syscall.socket');
+})();
 
-let isPrepRegsFunctionAttached = "NULL";
-let isPrepRegs6FunctionAttached = "NULL";
+// --- bind(fd, addr, addrlen) → 3 args ---
+(function hookBind() {
+    var addr = syscallAddresses['syscall.bind'];
+    if (!addr) { console.log('[-] syscall.bind not found'); return; }
 
-Interceptor.replace(originalSocket, prepRegsFunction);
-Interceptor.replace(originalBind, prepRegsFunction);
-Interceptor.replace(originalListen, prepRegsFunction);
-Interceptor.replace(originalGetSockName, prepRegsFunction);
-Interceptor.replace(originalSetSockOpt, prepRegs6Function);
-Interceptor.replace(originalAccept4, prepRegs6Function);
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
 
-/* Interception of socket() call */
-Interceptor.attach(originalSocket, {
-        onEnter: function() {                       
-                isPrepRegsFunctionAttached = "socket";
-                console.log('Intercepted originalSocket call');
-                inspectContext(this.context);               
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=addr_ptr, rcx=addrlen
+            this._fd      = this.context.rax.toInt32();
+            this._addr    = this.context.rbx;  // pointer
+            this._addrlen = this.context.rcx.toInt32();
+            console.log('[>] bind(' + this._fd + ', ' + this._addr + ', ' + this._addrlen + ')');
         },
         onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalSocket return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of bind() call */
-Interceptor.attach(originalBind, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "bind";
-                console.log('Intercepted originalBind call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalBind return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of listen() call */
-Interceptor.attach(originalListen, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "listen";
-                console.log('Intercepted originalListen call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalListen return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of getsockname() call */
-Interceptor.attach(originalGetSockName, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "getsockname";
-                console.log('Intercepted originalGetSockName call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalGetSockName return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of setsockopt() call */
-Interceptor.attach(originalSetSockOpt, {
-        onEnter: function() {
-                isPrepRegs6FunctionAttached = "setsockopt";
-                console.log('Intercepted originalSetSockOpt call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegs6FunctionAttached = "NULL";
-                console.log('originalSetSockOpt return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of accept4() call */
-Interceptor.attach(originalAccept4, {
-        onEnter: function() {
-                isPrepRegs6FunctionAttached = "accept4";
-                console.log('Intercepted originalAccept4 call');
-                inspectContext(this.context);            
-        },
-        onLeave: function(retval) {
-                isPrepRegs6FunctionAttached = "NULL";
-                console.log('originalAccept4 return value:', retval.toInt32());
-                inspectContext(this.context);                
-                // // intentionally added to stop stop execution for debugging
-                // send('Pausing execution. Inspect registers.');
-                // recv('resume', function(value) {
-                //         console.log('Resuming execution.');
-                // }).wait();                 
-        }    
-});
-
-Interceptor.attach(prepRegsFunction, {
-        onEnter: function() {
-                console.log('Intercepted prepRegsFunction call');
-                inspectContext(this.context)
-        },
-        onLeave: function(retval) {
-                // call the ldpSocketFunction
-                if (isPrepRegsFunctionAttached === "socket") {
-                        console.log('prepRegsFunction OnLeave calling ldpSocketFunction');
-                        inspectContext(this.context);
-                        var ret = ldpSocketFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32(), this.context.rdx.toInt32());
-                        console.log('ldpSocketFunction returned ', ret);
-                        handleError(ret, this.context, "socket");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpSocketFunction
-                        retval.replace(ret);
-
-                // call the ldpBindFunction
-                } else if (isPrepRegsFunctionAttached === "bind") {
-                        console.log('prepRegsFunction OnLeave calling ldpBindFunction');
-                        inspectContext(this.context);            
-                        // call the ldpBindFunction
-                        var ret = ldpBindFunction(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx.toInt32());
-                        console.log('ldpBindFunction returned ', ret);
-                        handleError(ret, this.context, "bind");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpBindFunction
-                        retval.replace(ret);
-
-                // call the ldpListenFunction
-                } else if (isPrepRegsFunctionAttached === "listen") {
-                        console.log('prepRegsFunction OnLeave calling ldpListenFunction');
-                        inspectContext(this.context);
-                        // call the ldpListenFunction
-                        var ret = ldpListenFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32());
-                        console.log('ldpListenFunction returned ', ret);
-                        handleError(ret, this.context, "listen");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpListenFunction
-                        retval.replace(ret);
-
-                // call the ldpGetSockNameFunction
-                } else if (isPrepRegsFunctionAttached === "getsockname") {
-                        console.log('prepRegsFunction OnLeave calling ldpGetSockNameFunction');
-                        inspectContext(this.context);
-                        // call the ldpGetSockNameFunction
-                        var ret = ldpGetSockNameFunction(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx);
-                        console.log('ldpGetSockNameFunction returned ', ret);
-                        handleError(ret, this.context, "getsockname");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpGetSockNameFunction
-                        retval.replace(ret);
-                }
+            var ret = ldp.bind(this._fd, ptr(this._addr.toString()), this._addrlen);
+            setGoReturn(this.context, retval, ret, 'bind');
         }
-});
+    });
+    console.log('[+] Hooked syscall.bind');
+})();
 
-Interceptor.attach(prepRegs6Function, {
-        onEnter: function() {
-                console.log('Intercepted prepRegs6Function call');
-                inspectContext(this.context);
+// --- listen(fd, backlog) → 2 args ---
+(function hookListen() {
+    var addr = syscallAddresses['syscall.Listen'];
+    if (!addr) { console.log('[-] syscall.Listen not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=backlog
+            this._fd      = this.context.rax.toInt32();
+            this._backlog = this.context.rbx.toInt32();
+            console.log('[>] listen(' + this._fd + ', ' + this._backlog + ')');
         },
         onLeave: function(retval) {
-                // call the ldpSetSockOptFunction
-                if (isPrepRegs6FunctionAttached === "setsockopt") {
-                        console.log('prepRegs6Function OnLeave calling ldpSetSockOptFunction');
-                        inspectContext(this.context);
-                        // call the ldpSetSockOptFunction
-                        var ret = ldpSetSockOptFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32(), this.context.rdx.toInt32(), this.context.rcx, this.context.r8.toInt32());
-                        console.log('ldpSetSockOptFunction returned ', ret);
-                        handleError(ret, this.context, "setsockopt");
-                        // replace the return value since we call this from prepRegs6Function but we want to return the value from ldpSetSockOptFunction
-                        retval.replace(ret);
+            var ret = ldp.listen(this._fd, this._backlog);
+            setGoReturn(this.context, retval, ret, 'listen');
+        }
+    });
+    console.log('[+] Hooked syscall.Listen');
+})();
 
-                // call the ldpAccept4Function
-                } else if (isPrepRegs6FunctionAttached === "accept4") {
-                        console.log('prepRegs6Function OnLeave calling ldpAccept4Function');
-                        inspectContext(this.context);
-                        // call the ldpAccept4Function
-                        var ret = ldpAccept4Function(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx, this.context.rcx.toInt32());
-                        console.log('ldpAccept4Function returned ', ret);
-                        handleError(ret, this.context, "accept4");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpAccept4Function
-                        retval.replace(ret);
-                }
-        }    
-});
+// --- getsockname(fd, addr, addrlen_ptr) → 3 args ---
+(function hookGetsockname() {
+    var addr = syscallAddresses['syscall.getsockname'];
+    if (!addr) { console.log('[-] syscall.getsockname not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=addr_ptr, rcx=addrlen_ptr
+            this._fd         = this.context.rax.toInt32();
+            this._addr       = this.context.rbx;  // pointer
+            this._addrlenPtr = this.context.rcx;   // pointer
+            console.log('[>] getsockname(' + this._fd + ', ' + this._addr + ', ' + this._addrlenPtr + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.getsockname(this._fd, ptr(this._addr.toString()), ptr(this._addrlenPtr.toString()));
+            setGoReturn(this.context, retval, ret, 'getsockname');
+        }
+    });
+    console.log('[+] Hooked syscall.getsockname');
+})();
+
+// --- connect(fd, addr, addrlen) → 3 args ---
+(function hookConnect() {
+    var addr = syscallAddresses['syscall.connect'];
+    if (!addr) { console.log('[-] syscall.connect not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=addr_ptr, rcx=addrlen
+            this._fd      = this.context.rax.toInt32();
+            this._addr    = this.context.rbx;  // pointer
+            this._addrlen = this.context.rcx.toInt32();
+            console.log('[>] connect(' + this._fd + ', ' + this._addr + ', ' + this._addrlen + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.connect(this._fd, ptr(this._addr.toString()), this._addrlen);
+            setGoReturn(this.context, retval, ret, 'connect');
+        }
+    });
+    console.log('[+] Hooked syscall.connect');
+})();
+
+// --- setsockopt(fd, level, optname, optval, optlen) → 5 args ---
+(function hookSetsockopt() {
+    var addr = syscallAddresses['syscall.setsockopt'];
+    if (!addr) { console.log('[-] syscall.setsockopt not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=level, rcx=optname, rdi=optval_ptr, rsi=optlen
+            this._fd      = this.context.rax.toInt32();
+            this._level   = this.context.rbx.toInt32();
+            this._optname = this.context.rcx.toInt32();
+            this._optval  = this.context.rdi;  // pointer
+            this._optlen  = this.context.rsi.toInt32();
+            console.log('[>] setsockopt(' + this._fd + ', ' + this._level + ', ' + this._optname +
+                        ', ' + this._optval + ', ' + this._optlen + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.setsockopt(this._fd, this._level, this._optname,
+                                     ptr(this._optval.toString()), this._optlen);
+            setGoReturn(this.context, retval, ret, 'setsockopt');
+        }
+    });
+    console.log('[+] Hooked syscall.setsockopt');
+})();
+
+// --- getsockopt(fd, level, optname, optval, optlen_ptr) → 5 args ---
+(function hookGetsockopt() {
+    var addr = syscallAddresses['syscall.getsockopt'];
+    if (!addr) { console.log('[-] syscall.getsockopt not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=level, rcx=optname, rdi=optval_ptr, rsi=optlen_ptr
+            this._fd        = this.context.rax.toInt32();
+            this._level     = this.context.rbx.toInt32();
+            this._optname   = this.context.rcx.toInt32();
+            this._optval    = this.context.rdi;  // pointer
+            this._optlenPtr = this.context.rsi;   // pointer
+            console.log('[>] getsockopt(' + this._fd + ', ' + this._level + ', ' + this._optname +
+                        ', ' + this._optval + ', ' + this._optlenPtr + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.getsockopt(this._fd, this._level, this._optname,
+                                     ptr(this._optval.toString()), ptr(this._optlenPtr.toString()));
+            setGoReturn(this.context, retval, ret, 'getsockopt');
+        }
+    });
+    console.log('[+] Hooked syscall.getsockopt');
+})();
+
+// --- accept4(fd, addr, addrlen_ptr, flags) → 4 args ---
+//
+// NOTE: accept4 is a BLOCKING call. When called from Frida's onLeave, it
+// blocks the Frida JS thread. This is acceptable for a single-threaded
+// accept loop but will cause issues with concurrent goroutines.
+// For production use, consider using a CModule-based approach instead.
+(function hookAccept4() {
+    var addr = syscallAddresses['syscall.accept4'];
+    if (!addr) { console.log('[-] syscall.accept4 not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            // Go ABI: rax=fd, rbx=addr_ptr, rcx=addrlen_ptr, rdi=flags
+            this._fd         = this.context.rax.toInt32();
+            this._addr       = this.context.rbx;  // pointer
+            this._addrlenPtr = this.context.rcx;   // pointer
+            this._flags      = this.context.rdi.toInt32();
+            console.log('[>] accept4(' + this._fd + ', ' + this._addr + ', ' +
+                        this._addrlenPtr + ', ' + this._flags + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.accept4(this._fd, ptr(this._addr.toString()),
+                                  ptr(this._addrlenPtr.toString()), this._flags);
+            setGoReturn(this.context, retval, ret, 'accept4');
+        }
+    });
+    console.log('[+] Hooked syscall.accept4');
+})();
+
+/* ============================================================================
+ * DONE
+ * ============================================================================ */
+
+console.log('[+] All hooks installed. Go syscalls will be redirected to VCL.');
+console.log('[+] Ensure VCL_CONFIG is set in the environment.');

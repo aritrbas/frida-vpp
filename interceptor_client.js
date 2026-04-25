@@ -1,430 +1,231 @@
-/* Setup */
 /*
-        1. apt update
-        2. apt instal python3-pip
-        3. pip3 install frida
-        4. pip3 install frida-tools
-        5. apt install less (for debugging with objdump)
-                eg) objdump -lSd /usr/lib/libvcl_ldpreload.so | less
-        6. Compile the assmebly patch code to hack register mismatch between Go ABI and SystemV ABI
-                i)  nasm -f elf64 -DPIC prepRegs.asm
-                ii) gcc -shared -fPIC prepRegs.o -o libPrepRegs.so
-        7. Create a hst test framework and persist it
-                i) sudo make test-debug PERSIST=true TEST=LDPreloadIperfVppTest
-        7. Copy the libraries, binary and interception.js script to the docker containers
-                i)   docker cp libvcl_ldpreload.so <container_id>:/usr/lib/libvcl_ldpreload.so
-                ii)  docker cp libPrepRegs.so <container_id>:/usr/lib/libPrepRegs.so
-                iii) docker cp test_server_go <container_id>:/usr/bin/test_server_go
-                iv)  docker cp interception.js <container_id>:/usr/bin/interception.js
-        8. Run test binary with Frida
-                eg) VCL_CONFIG=/tmp/server-share/vcl.conf frida /usr/bin/test_server_go -l interceptor.js
-                NOTE: binary path must be absolute, interceptor script path can be relative
-        *** How to figure out the system calls to intercept? ***
-                i) Run the binary with strace and check for the libc syscalls
-                        eg) strace -f -e trace=network test_server_go [socket, setsockopt, bind, listen, getsockname, accept4] [socket, getsockopt, connect]
-                ii) Then use gdb on the binary to trace it back to the Go syscalls
-                        eg) gdb test_server_go [b syscall.socket, b syscall.setsockopt, b syscall.bind, b syscall.Listen, b syscall.getsockname, b syscall.accept4, r]
-                iii) Generally the Go syscall flow is like this:
-                        syscall.Socket ==> syscall.socket ==> syscall.RawSyscall ==> syscall.RawSyscall6 ==> ASM code to manipulate registers as per SystemV ABI standards ==> SYSCALL
-*/
+ * Frida VPP/VCL Interceptor for Go Client Binaries
+ *
+ * Same architecture as interceptor_server.js but targets client binaries.
+ * Does NOT hook accept4 or listen (not needed for client).
+ * Hooks: socket, connect, setsockopt, getsockopt, getsockname, bind.
+ *
+ * Run:
+ *   VCL_CONFIG=/tmp/client-share/vcl.conf frida ./echo_client -l interceptor_client.js
+ */
 
+'use strict';
 
-
-/* Find the addresses of Go syscalls */
 const moduleName = 'echo_client';
-const syscalls = ['syscall.socket', 'syscall.setsockopt', 'syscall.bind', 'syscall.Listen', 'syscall.getsockname', 'syscall.accept4', 'syscall.getsockopt', 'syscall.connect', 'syscall.errEAGAIN', 'go:itab.syscall.Errno,error'];
 
-// Create a hashmap to store the addresses of each Go syscall (to be used in interception later)
-const syscallAddresses = {};
-
-// Store the address of a given Go syscall
-function setupInterceptor(name) {
-        Module.enumerateSymbols(moduleName, {
-                onMatch: function (exp) {
-                        if (exp.name === name) {
-                                console.log(`Found ${name} at address: ${exp.address}`);
-                                syscallAddresses[name] = exp.address; // Store the address in the hashmap
-                        }
-                },
-                onComplete: function () {
-                        console.log(`Finished enumerating exports for ${moduleName}`);
-                }
-        });
-}
-
-// Store the addresses of all Go syscalls
-syscalls.forEach(setupInterceptor);
-
-/* Load the required modules in the process address space */
-const modules = [
-        '/usr/lib/libvcl_ldpreload.so', // VCL LD Preload library
-        '/usr/lib/libPrepRegs.so' // assembly code to hack register mismatch between Go ABI and SystemV ABI
+const syscallNames = [
+    'syscall.socket',
+    'syscall.setsockopt',
+    'syscall.getsockopt',
+    'syscall.bind',
+    'syscall.getsockname',
+    'syscall.connect'
 ];
 
-// Check if the library is loaded
-function checkLibraryLoaded(moduleName) {
-        let loaded = false;
+/* Find Go symbol addresses */
+const syscallAddresses = {};
+syscallNames.forEach(function(name) {
+    Module.enumerateSymbols(moduleName, {
+        onMatch: function(exp) {
+            if (exp.name === name) {
+                syscallAddresses[name] = exp.address;
+                console.log('[+] Found ' + name + ' at ' + exp.address);
+            }
+        },
+        onComplete: function() {}
+    });
+});
 
-        Process.enumerateModules({
-                onMatch: function(module) {
-                        if (module.name === moduleName) {
-                                loaded = true;
-                                console.log(`${module.name} is loaded at ${module.base}`);
-                        }
-                },
-                onComplete: function() {
-                        if (!loaded) {
-                                console.log(`${moduleName} is not loaded.`);
-                        }
-                }
-        });
+/* Load VCL library */
+const VCL_LIB = '/usr/lib/libvcl_ldpreload.so';
+(function loadVCL() {
+    var loaded = false;
+    Process.enumerateModules({
+        onMatch: function(m) { if (m.path === VCL_LIB || m.name === 'libvcl_ldpreload.so') loaded = true; },
+        onComplete: function() {}
+    });
+    if (!loaded) {
+        Module.load(VCL_LIB);
+        console.log('[+] Loaded ' + VCL_LIB);
+    } else {
+        console.log('[+] ' + VCL_LIB + ' already loaded');
+    }
+})();
 
-        return loaded;
+/* Resolve LDP functions */
+const ldp = {
+    socket:      new NativeFunction(Module.findExportByName(VCL_LIB, 'socket'),      'int', ['int', 'int', 'int']),
+    bind:        new NativeFunction(Module.findExportByName(VCL_LIB, 'bind'),        'int', ['int', 'pointer', 'int']),
+    connect:     new NativeFunction(Module.findExportByName(VCL_LIB, 'connect'),     'int', ['int', 'pointer', 'int']),
+    setsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'setsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'int']),
+    getsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'pointer']),
+    getsockname: new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockname'), 'int', ['int', 'pointer', 'pointer']),
+};
+
+/* C errno helper */
+const errnoLocation = new NativeFunction(
+    Module.findExportByName(null, '__errno_location'), 'pointer', []
+);
+function getCErrno() { return errnoLocation().readInt(); }
+
+/* Go return value helper */
+function setGoReturn(context, retval, result, syscallName) {
+    if (result < 0) {
+        var errno = getCErrno();
+        console.log('[!] ' + syscallName + ' failed: ret=' + result + ', errno=' + errno);
+        retval.replace(-1);
+        context.rbx = ptr(0);
+        context.rcx = ptr(errno);
+    } else {
+        console.log('[+] ' + syscallName + ' succeeded: ret=' + result);
+        retval.replace(result);
+        context.rbx = ptr(0);
+        context.rcx = ptr(0);
+    }
 }
 
-// Load the library if not loaded
-function loadLibrary(moduleName) {
-        const myLib = Module.load(moduleName);
-        if (myLib) {
-                console.log(`${moduleName} loaded successfully.`);
-        } else {
-                console.log(`Failed to load ${moduleName}`);
-        }
+function allocateRetTrampoline() {
+    var block = Memory.alloc(Process.pageSize);
+    Memory.patchCode(block, 16, function(code) {
+        var w = new X86Writer(code, { pc: block });
+        w.putRet();
+        w.flush();
+    });
+    return block;
 }
 
-// Main execution
-modules.forEach(moduleName => {
-        if (!checkLibraryLoaded(moduleName)) {
-                loadLibrary(moduleName);
+/* Hook socket */
+(function hookSocket() {
+    var addr = syscallAddresses['syscall.socket'];
+    if (!addr) { console.log('[-] syscall.socket not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._domain   = this.context.rax.toInt32();
+            this._type     = this.context.rbx.toInt32();
+            this._protocol = this.context.rcx.toInt32();
+            console.log('[>] socket(' + this._domain + ', ' + this._type + ', ' + this._protocol + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.socket(this._domain, this._type, this._protocol);
+            setGoReturn(this.context, retval, ret, 'socket');
         }
-});
+    });
+    console.log('[+] Hooked syscall.socket');
+})();
 
-
-
-/* Logging for debugging */
-const prepRegsAddress = Module.findExportByName('/usr/lib/libPrepRegs.so', 'prepRegs');
-const prepRegsFunction = new NativeFunction(prepRegsAddress, 'void', []);
-
-const prepRegs6Address = Module.findExportByName('/usr/lib/libPrepRegs.so', 'prepRegs6');
-const prepRegs6Function = new NativeFunction(prepRegs6Address, 'void', []);
-
-// const updateRegsAddress = Module.findExportByName('/usr/lib/libPrepRegs.so', 'updateRegs');
-// const updateRegsFunction = new NativeFunction(updateRegsAddress, 'void', ['int']);
-
-const originalSocket = syscallAddresses['syscall.socket'];
-const ldpSocketAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'socket');
-const ldpSocketFunction = new NativeFunction(ldpSocketAddress, 'int', ['int', 'int', 'int']);
-
-const originalSetSockOpt = syscallAddresses['syscall.setsockopt'];
-const ldpSetSockOptAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'setsockopt');
-const ldpSetSockOptFunction = new NativeFunction(ldpSetSockOptAddress, 'int', ['int', 'int', 'int', 'pointer', 'int']);
-
-const originalBind = syscallAddresses['syscall.bind'];
-const ldpBindAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'bind');
-const ldpBindFunction = new NativeFunction(ldpBindAddress, 'int', ['int', 'pointer', 'int']);
-
-const originalListen = syscallAddresses['syscall.Listen'];
-const ldpListenAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'listen');
-const ldpListenFunction = new NativeFunction(ldpListenAddress, 'int', ['int', 'int']);
-
-const originalGetSockName = syscallAddresses['syscall.getsockname'];
-const ldpGetSockNameAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'getsockname');
-const ldpGetSockNameFunction = new NativeFunction(ldpGetSockNameAddress, 'int', ['int', 'pointer', 'pointer']);
-
-const originalAccept4 = syscallAddresses['syscall.accept4'];
-const ldpAccept4Address = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'accept4');
-const ldpAccept4Function = new NativeFunction(ldpAccept4Address, 'int', ['int', 'pointer', 'pointer', 'int']);
-
-const originalGetSockOpt = syscallAddresses['syscall.getsockopt'];
-const ldpGetSockOptAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'getsockopt');
-const ldpGetSockOptFunction = new NativeFunction(ldpGetSockOptAddress, 'int', ['int', 'int', 'int', 'pointer', 'pointer']);
-
-const originalConnect = syscallAddresses['syscall.connect'];
-const ldpConnectAddress = Module.findExportByName('/usr/lib/libvcl_ldpreload.so', 'connect');
-const ldpConnectFunction = new NativeFunction(ldpConnectAddress, 'int', ['int', 'pointer', 'int']);
-
-const errnoPtrC = Module.findExportByName(null, '__errno_location');
-const errnoFuncC = new NativeFunction(errnoPtrC, 'pointer', []);
-
-console.log(`prepRegsAddress: ${prepRegsAddress}`); // <= 3 args
-console.log(`prepRegs6Address: ${prepRegs6Address}`); // <= 6 args
-// console.log(`updateRegsAddress: ${updateRegsAddress}`);
-
-console.log(`originalSocket address: ${originalSocket}`);
-console.log(`ldpSocketAddress: ${ldpSocketAddress}`);
-
-console.log(`originalSetSockOpt address: ${originalSetSockOpt}`);
-console.log(`ldpSetSockOptAddress: ${ldpSetSockOptAddress}`);
-
-console.log(`originalBind address: ${originalBind}`);
-console.log(`ldpBindAddress: ${ldpBindAddress}`);
-
-console.log(`originalListen address: ${originalListen}`);
-console.log(`ldpListenAddress: ${ldpListenAddress}`);
-
-console.log(`originalGetSockName address: ${originalGetSockName}`);
-console.log(`ldpGetSockNameAddress: ${ldpGetSockNameAddress}`);
-
-console.log(`originalAccept4 address: ${originalAccept4}`);
-console.log(`ldpAccept4Address: ${ldpAccept4Address}`);
-
-console.log(`originalGetSockOpt address: ${originalGetSockOpt}`);
-console.log(`ldpGetSockOptAddress: ${ldpGetSockOptAddress}`);
-
-console.log(`originalConnect address: ${originalConnect}`);
-console.log(`ldpConnectAddress: ${ldpConnectAddress}`);
-
-console.log(`__errno_location Address: ${errnoPtrC}`);
-
-function inspectContext(context) {
-        // Inspect the registers
-        var registers = context;
-        console.log('Registers:', JSON.stringify(registers, null, 2));
-        // Inspect the stack
-        var stackPointer = context.sp;
-        console.log('Stack pointer:', stackPointer);
-}
-
-function handleError(ret, context, syscallName) {
-        if (ret === -1) {
-                var errno = errnoFuncC().readInt();
-                console.log(`errno in ${syscallName} `, errno);
-                context.rax = -1;
-                context.rbx = 0;
-                context.rcx = errno;
+/* Hook bind */
+(function hookBind() {
+    var addr = syscallAddresses['syscall.bind'];
+    if (!addr) { console.log('[-] syscall.bind not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd      = this.context.rax.toInt32();
+            this._addr    = this.context.rbx;
+            this._addrlen = this.context.rcx.toInt32();
+            console.log('[>] bind(' + this._fd + ', ' + this._addr + ', ' + this._addrlen + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.bind(this._fd, ptr(this._addr.toString()), this._addrlen);
+            setGoReturn(this.context, retval, ret, 'bind');
         }
-}
+    });
+    console.log('[+] Hooked syscall.bind');
+})();
 
-let isPrepRegsFunctionAttached = "NULL";
-let isPrepRegs6FunctionAttached = "NULL";
-
-Interceptor.replace(originalSocket, prepRegsFunction);
-Interceptor.replace(originalBind, prepRegsFunction);
-Interceptor.replace(originalListen, prepRegsFunction);
-Interceptor.replace(originalGetSockName, prepRegsFunction);
-Interceptor.replace(originalSetSockOpt, prepRegs6Function);
-// Interceptor.replace(originalAccept4, prepRegs6Function);
-Interceptor.replace(originalGetSockOpt, prepRegs6Function);
-Interceptor.replace(originalConnect, prepRegsFunction);
-
-/* Interception of socket() call */
-Interceptor.attach(originalSocket, {
-        onEnter: function() {                       
-                isPrepRegsFunctionAttached = "socket";
-                console.log('Intercepted originalSocket call');
-                inspectContext(this.context);               
+/* Hook getsockname */
+(function hookGetsockname() {
+    var addr = syscallAddresses['syscall.getsockname'];
+    if (!addr) { console.log('[-] syscall.getsockname not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd         = this.context.rax.toInt32();
+            this._addr       = this.context.rbx;
+            this._addrlenPtr = this.context.rcx;
+            console.log('[>] getsockname(' + this._fd + ', ' + this._addr + ', ' + this._addrlenPtr + ')');
         },
         onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalSocket return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of bind() call */
-Interceptor.attach(originalBind, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "bind";
-                console.log('Intercepted originalBind call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalBind return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of listen() call */
-Interceptor.attach(originalListen, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "listen";
-                console.log('Intercepted originalListen call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalListen return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of getsockname() call */
-Interceptor.attach(originalGetSockName, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "getsockname";
-                console.log('Intercepted originalGetSockName call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalGetSockName return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of setsockopt() call */
-Interceptor.attach(originalSetSockOpt, {
-        onEnter: function() {
-                isPrepRegs6FunctionAttached = "setsockopt";
-                console.log('Intercepted originalSetSockOpt call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegs6FunctionAttached = "NULL";
-                console.log('originalSetSockOpt return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of accept4() call */
-// Interceptor.attach(originalAccept4, {
-//         onEnter: function() {
-//                 isPrepRegs6FunctionAttached = "accept4";
-//                 console.log('Intercepted originalAccept4 call');
-//                 inspectContext(this.context);
-//         },
-//         onLeave: function(retval) {
-//                 isPrepRegs6FunctionAttached = "NULL";
-//                 console.log('originalAccept4 return value:', retval.toInt32());
-//                 inspectContext(this.context);                
-//         }    
-// });
-
-/* Interception of getsockopt() call */
-Interceptor.attach(originalGetSockOpt, {
-        onEnter: function() {
-                isPrepRegs6FunctionAttached = "getsockopt";
-                console.log('Intercepted originalGetSockOpt call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegs6FunctionAttached = "NULL";
-                console.log('originalGetSockOpt return value:', retval.toInt32());
-                inspectContext(this.context);
-        }    
-});
-
-/* Interception of connect() call */
-Interceptor.attach(originalConnect, {
-        onEnter: function() {
-                isPrepRegsFunctionAttached = "connect";
-                console.log('Intercepted originalConnect call');
-                inspectContext(this.context);
-        },
-        onLeave: function(retval) {
-                isPrepRegsFunctionAttached = "NULL";
-                console.log('originalConnect return value:', retval.toInt32());
-                inspectContext(this.context);
-                // intentionally added to stop stop execution for debugging
-                send('Pausing execution. Inspect registers.');
-                recv('resume', function(value) {
-                        console.log('Resuming execution.');
-                }).wait();                 
-        }    
-});
-
-Interceptor.attach(prepRegsFunction, {
-        onEnter: function() {
-                console.log('Intercepted prepRegsFunction call');
-                inspectContext(this.context)
-        },
-        onLeave: function(retval) {
-                // call the ldpSocketFunction
-                if (isPrepRegsFunctionAttached === "socket") {
-                        console.log('prepRegsFunction OnLeave calling ldpSocketFunction');
-                        inspectContext(this.context);
-                        var ret = ldpSocketFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32(), this.context.rdx.toInt32());
-                        console.log('ldpSocketFunction returned ', ret);
-                        handleError(ret, this.context, "socket");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpSocketFunction
-                        retval.replace(ret);
-
-                // call the ldpBindFunction
-                } else if (isPrepRegsFunctionAttached === "bind") {
-                        console.log('prepRegsFunction OnLeave calling ldpBindFunction');
-                        inspectContext(this.context);            
-                        // call the ldpBindFunction
-                        var ret = ldpBindFunction(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx.toInt32());
-                        console.log('ldpBindFunction returned ', ret);
-                        handleError(ret, this.context, "bind");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpBindFunction
-                        retval.replace(ret);
-
-                // call the ldpListenFunction
-                } else if (isPrepRegsFunctionAttached === "listen") {
-                        console.log('prepRegsFunction OnLeave calling ldpListenFunction');
-                        inspectContext(this.context);
-                        // call the ldpListenFunction
-                        var ret = ldpListenFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32());
-                        console.log('ldpListenFunction returned ', ret);
-                        handleError(ret, this.context, "listen");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpListenFunction
-                        retval.replace(ret);
-
-                // call the ldpGetSockNameFunction
-                } else if (isPrepRegsFunctionAttached === "getsockname") {
-                        console.log('prepRegsFunction OnLeave calling ldpGetSockNameFunction');
-                        inspectContext(this.context);
-                        // call the ldpGetSockNameFunction
-                        var ret = ldpGetSockNameFunction(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx);
-                        console.log('ldpGetSockNameFunction returned ', ret);
-                        handleError(ret, this.context, "getsockname");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpGetSockNameFunction
-                        retval.replace(ret);
-
-                // call the ldpConnectFunction
-                } else if (isPrepRegsFunctionAttached === "connect") {                  
-                        console.log('prepRegsFunction OnLeave calling ldpConnectFunction');
-                        inspectContext(this.context);
-                        // call the ldpConnectFunction
-                        var ret = ldpConnectFunction(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx.toInt32());
-                        console.log('ldpConnectFunction returned ', ret);
-                        handleError(ret, this.context, "connect");
-                         // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpConnectFunction
-                        retval.replace(ret);
-                }                
+            var ret = ldp.getsockname(this._fd, ptr(this._addr.toString()), ptr(this._addrlenPtr.toString()));
+            setGoReturn(this.context, retval, ret, 'getsockname');
         }
-});
+    });
+    console.log('[+] Hooked syscall.getsockname');
+})();
 
-Interceptor.attach(prepRegs6Function, {
-        onEnter: function() {
-                console.log('Intercepted prepRegs6Function call');
-                inspectContext(this.context);
+/* Hook connect */
+(function hookConnect() {
+    var addr = syscallAddresses['syscall.connect'];
+    if (!addr) { console.log('[-] syscall.connect not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd      = this.context.rax.toInt32();
+            this._addr    = this.context.rbx;
+            this._addrlen = this.context.rcx.toInt32();
+            console.log('[>] connect(' + this._fd + ', ' + this._addr + ', ' + this._addrlen + ')');
         },
         onLeave: function(retval) {
-                // call the ldpSetSockOptFunction
-                if (isPrepRegs6FunctionAttached === "setsockopt") {
-                        console.log('prepRegs6Function OnLeave calling ldpSetSockOptFunction');
-                        inspectContext(this.context);
-                        // call the ldpSetSockOptFunction
-                        var ret = ldpSetSockOptFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32(), this.context.rdx.toInt32(), this.context.rcx, this.context.r8.toInt32());
-                        console.log('ldpSetSockOptFunction returned ', ret);
-                        handleError(ret, this.context, "setsockopt");
-                        // replace the return value since we call this from prepRegs6Function but we want to return the value from ldpSetSockOptFunction
-                        retval.replace(ret);
+            var ret = ldp.connect(this._fd, ptr(this._addr.toString()), this._addrlen);
+            setGoReturn(this.context, retval, ret, 'connect');
+        }
+    });
+    console.log('[+] Hooked syscall.connect');
+})();
 
-                // call the ldpAccept4Function
-                } else if (isPrepRegs6FunctionAttached === "accept4") {
-                        console.log('prepRegs6Function OnLeave calling ldpAccept4Function');
-                        inspectContext(this.context);
-                        // call the ldpAccept4Function
-                        var ret = ldpAccept4Function(this.context.rdi.toInt32(), this.context.rsi, this.context.rdx, this.context.rcx.toInt32());
-                        console.log('ldpAccept4Function returned ', ret);
-                        handleError(ret, this.context, "accept4");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpAccept4Function
-                        retval.replace(ret);
+/* Hook setsockopt */
+(function hookSetsockopt() {
+    var addr = syscallAddresses['syscall.setsockopt'];
+    if (!addr) { console.log('[-] syscall.setsockopt not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd      = this.context.rax.toInt32();
+            this._level   = this.context.rbx.toInt32();
+            this._optname = this.context.rcx.toInt32();
+            this._optval  = this.context.rdi;
+            this._optlen  = this.context.rsi.toInt32();
+            console.log('[>] setsockopt(' + this._fd + ', ' + this._level + ', ' + this._optname +
+                        ', ' + this._optval + ', ' + this._optlen + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.setsockopt(this._fd, this._level, this._optname,
+                                     ptr(this._optval.toString()), this._optlen);
+            setGoReturn(this.context, retval, ret, 'setsockopt');
+        }
+    });
+    console.log('[+] Hooked syscall.setsockopt');
+})();
 
-                // call the ldpGetSockOptFunction
-                } else if (isPrepRegs6FunctionAttached == "getsockopt") {
-                        console.log('prepRegs6Function OnLeave calling ldpGetSockOptFunction');
-                        inspectContext(this.context);
-                        // call the ldpGetSockOptFunction
-                        var ret = ldpGetSockOptFunction(this.context.rdi.toInt32(), this.context.rsi.toInt32(), this.context.rdx.toInt32(), this.context.rcx, this.context.r8);
-                        console.log('ldpGetSockOptFunction returned ', ret);
-                        handleError(ret, this.context, "getsockopt");
-                        // replace the return value since we call this from prepRegsFunction but we want to return the value from ldpGetSockOptFunction
-                        retval.replace(ret);
-                }
-        }    
-});
+/* Hook getsockopt */
+(function hookGetsockopt() {
+    var addr = syscallAddresses['syscall.getsockopt'];
+    if (!addr) { console.log('[-] syscall.getsockopt not found'); return; }
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd        = this.context.rax.toInt32();
+            this._level     = this.context.rbx.toInt32();
+            this._optname   = this.context.rcx.toInt32();
+            this._optval    = this.context.rdi;
+            this._optlenPtr = this.context.rsi;
+            console.log('[>] getsockopt(' + this._fd + ', ' + this._level + ', ' + this._optname +
+                        ', ' + this._optval + ', ' + this._optlenPtr + ')');
+        },
+        onLeave: function(retval) {
+            var ret = ldp.getsockopt(this._fd, this._level, this._optname,
+                                     ptr(this._optval.toString()), ptr(this._optlenPtr.toString()));
+            setGoReturn(this.context, retval, ret, 'getsockopt');
+        }
+    });
+    console.log('[+] Hooked syscall.getsockopt');
+})();
+
+console.log('[+] All client hooks installed. Go syscalls will be redirected to VCL.');
