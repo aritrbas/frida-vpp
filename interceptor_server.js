@@ -36,6 +36,13 @@
 // Change this to your Go binary name (without path)
 const moduleName = 'echo_server';
 
+// Path to VCL LD_PRELOAD library.
+// MUST match your VPP build. Run:
+//   find /home/aritrbas/vpp/build-root -name 'libvcl_ldpreload.so' 2>/dev/null
+// Also set LD_LIBRARY_PATH to the same directory before running frida:
+//   export LD_LIBRARY_PATH=/home/aritrbas/vpp/build-root/install-vpp_debug-native/vpp/lib/x86_64-linux-gnu
+const VCL_LIB = '/home/aritrbas/vpp/build-root/install-vpp_debug-native/vpp/lib/x86_64-linux-gnu/libvcl_ldpreload.so';
+
 // Syscalls to intercept
 const syscallNames = [
     'syscall.socket',
@@ -45,7 +52,10 @@ const syscallNames = [
     'syscall.Listen',
     'syscall.getsockname',
     'syscall.accept4',
-    'syscall.connect'
+    'syscall.connect',
+    'syscall.read',
+    'syscall.write',
+    'syscall.Close',
 ];
 
 /* ============================================================================
@@ -54,68 +64,145 @@ const syscallNames = [
 
 const syscallAddresses = {};
 
-syscallNames.forEach(function(name) {
-    Module.enumerateSymbols(moduleName, {
-        onMatch: function(exp) {
-            if (exp.name === name) {
-                syscallAddresses[name] = exp.address;
-                console.log('[+] Found ' + name + ' at ' + exp.address);
-            }
-        },
-        onComplete: function() {}
-    });
+Process.getModuleByName(moduleName).enumerateSymbols().forEach(function(sym) {
+    if (syscallNames.indexOf(sym.name) !== -1) {
+        syscallAddresses[sym.name] = sym.address;
+        console.log('[+] Found ' + sym.name + ' at ' + sym.address);
+    }
 });
 
 /* ============================================================================
  * STEP 2: Load VCL library
+ * Requires LD_LIBRARY_PATH to include the VPP lib dir, e.g.:
+ *   export LD_LIBRARY_PATH=/home/aritrbas/vpp/build-root/install-vpp_debug-native/vpp/lib/x86_64-linux-gnu
  * ============================================================================ */
 
-const VCL_LIB = '/usr/lib/libvcl_ldpreload.so';
+// Frida 17 removed findExport(modName, sym) static form.
+// Use instance method via Process.findModuleByName instead.
+function findExport(modName, symName) {
+    var mod = Process.findModuleByName(modName);
+    if (!mod) {
+        // Module not yet loaded — search all loaded modules
+        var addr = null;
+        Process.enumerateModules().some(function(m) {
+            var a = m.findExportByName(symName);
+            if (a) { addr = a; return true; }
+            return false;
+        });
+        return addr;
+    }
+    return mod.findExportByName(symName);
+}
+
+// findExport() resolves through the dynamic linker's GOT/PLT, which returns
+// libc's interposed functions (socket, bind, connect, etc.) instead of LDP's
+// own implementations when those symbols are PLT-intercepted.
+//
+// findLdpSym() bypasses this by enumerating LDP's own symbol table directly,
+// returning the actual function address in LDP's .text section.
+var _ldpSymCache = {};
+function findLdpSym(symName) {
+    if (_ldpSymCache[symName]) return _ldpSymCache[symName];
+    // Module.load() loads the symlink target; Frida registers the versioned soname.
+    // Search all modules for any name or path containing 'ldpreload'.
+    var mod = null;
+    Process.enumerateModules().some(function(m) {
+        if (m.name.indexOf('ldpreload') !== -1 || m.path.indexOf('ldpreload') !== -1) {
+            mod = m; return true;
+        }
+        return false;
+    });
+    if (!mod) { console.log('[!] libvcl_ldpreload not found in modules'); return null; }
+    var addr = null;
+    mod.enumerateSymbols().some(function(sym) {
+        if (sym.name === symName && sym.address && !sym.address.isNull()) {
+            addr = sym.address;
+            return true;
+        }
+        return false;
+    });
+    if (!addr) {
+        // Fall back to exports (may be wrong, but log it)
+        addr = mod.findExportByName(symName);
+        console.log('[!] findLdpSym(' + symName + '): not in symbols, using export ' + addr);
+    } else {
+        _ldpSymCache[symName] = addr;
+    }
+    return addr;
+}
+
+// Frida has no built-in env-var API; use libc getenv() directly.
+var _getenv = new NativeFunction(findExport('libc.so.6', 'getenv'), 'pointer', ['pointer']);
+function getEnv(name) {
+    var p = _getenv(Memory.allocUtf8String(name));
+    return p.isNull() ? null : p.readUtf8String();
+}
 
 (function loadVCL() {
-    var loaded = false;
-    Process.enumerateModules({
-        onMatch: function(m) { if (m.path === VCL_LIB || m.name === 'libvcl_ldpreload.so') loaded = true; },
-        onComplete: function() {}
+    // Skip VCL loading if VCL_CONFIG is not set — allows hooks-only testing (Step 3).
+    var vclConfig = getEnv('VCL_CONFIG');
+    if (!vclConfig) {
+        console.log('[*] VCL_CONFIG not set — loading VCL in passthrough mode (hooks fire, syscalls go to kernel).');
+        console.log('[*] Set VCL_CONFIG=/path/to/vcl.conf to redirect to VPP.');
+        return;
+    }
+    var loaded = Process.enumerateModules().some(function(m) {
+        return m.path === VCL_LIB || m.name === 'libvcl_ldpreload.so';
     });
     if (!loaded) {
-        Module.load(VCL_LIB);
+        try {
+            Module.load(VCL_LIB);
+        } catch (e) {
+            console.log('[!] FATAL: Failed to load ' + VCL_LIB + ': ' + e);
+            console.log('[!] Fix: export LD_LIBRARY_PATH=/home/aritrbas/vpp/build-root/install-vpp_debug-native/vpp/lib/x86_64-linux-gnu');
+            throw e;
+        }
         console.log('[+] Loaded ' + VCL_LIB);
     } else {
         console.log('[+] ' + VCL_LIB + ' already loaded');
     }
 })();
 
+const vclEnabled = !!getEnv('VCL_CONFIG');
+
 /* ============================================================================
  * STEP 3: Resolve LDP (VCL LD_PRELOAD) function addresses
+ * (only when VCL_CONFIG is set)
  * ============================================================================ */
 
+if (!vclEnabled) {
+    console.log('[*] Hooks installed in passthrough mode. Syscalls go to kernel (no VCL redirection).');
+} else {
+
 const ldp = {
-    socket:      new NativeFunction(Module.findExportByName(VCL_LIB, 'socket'),      'int', ['int', 'int', 'int']),
-    bind:        new NativeFunction(Module.findExportByName(VCL_LIB, 'bind'),        'int', ['int', 'pointer', 'int']),
-    listen:      new NativeFunction(Module.findExportByName(VCL_LIB, 'listen'),      'int', ['int', 'int']),
-    accept4:     new NativeFunction(Module.findExportByName(VCL_LIB, 'accept4'),     'int', ['int', 'pointer', 'pointer', 'int']),
-    connect:     new NativeFunction(Module.findExportByName(VCL_LIB, 'connect'),     'int', ['int', 'pointer', 'int']),
-    setsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'setsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'int']),
-    getsockopt:  new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'pointer']),
-    getsockname: new NativeFunction(Module.findExportByName(VCL_LIB, 'getsockname'), 'int', ['int', 'pointer', 'pointer']),
+    socket:      new NativeFunction(findLdpSym('socket'),      'int', ['int', 'int', 'int']),
+    bind:        new NativeFunction(findLdpSym('bind'),        'int', ['int', 'pointer', 'int']),
+    listen:      new NativeFunction(findLdpSym('listen'),      'int', ['int', 'int']),
+    accept4:     new NativeFunction(findLdpSym('accept4'),     'int', ['int', 'pointer', 'pointer', 'int']),
+    connect:     new NativeFunction(findLdpSym('connect'),     'int', ['int', 'pointer', 'int']),
+    setsockopt:  new NativeFunction(findLdpSym('setsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'int']),
+    getsockopt:  new NativeFunction(findLdpSym('getsockopt'),  'int', ['int', 'int', 'int', 'pointer', 'pointer']),
+    getsockname: new NativeFunction(findLdpSym('getsockname'), 'int', ['int', 'pointer', 'pointer']),
+    read:        new NativeFunction(findLdpSym('read'),        'int', ['int', 'pointer', 'int']),
+    write:       new NativeFunction(findLdpSym('write'),       'int', ['int', 'pointer', 'int']),
+    close:       new NativeFunction(findLdpSym('close'),       'int', ['int']),
 };
 
-console.log('[+] LDP socket:      ' + Module.findExportByName(VCL_LIB, 'socket'));
-console.log('[+] LDP bind:        ' + Module.findExportByName(VCL_LIB, 'bind'));
-console.log('[+] LDP listen:      ' + Module.findExportByName(VCL_LIB, 'listen'));
-console.log('[+] LDP accept4:     ' + Module.findExportByName(VCL_LIB, 'accept4'));
-console.log('[+] LDP connect:     ' + Module.findExportByName(VCL_LIB, 'connect'));
-console.log('[+] LDP setsockopt:  ' + Module.findExportByName(VCL_LIB, 'setsockopt'));
-console.log('[+] LDP getsockopt:  ' + Module.findExportByName(VCL_LIB, 'getsockopt'));
-console.log('[+] LDP getsockname: ' + Module.findExportByName(VCL_LIB, 'getsockname'));
+console.log('[+] LDP socket:      ' + findLdpSym('socket'));
+console.log('[+] LDP bind:        ' + findLdpSym('bind'));
+console.log('[+] LDP listen:      ' + findLdpSym('listen'));
+console.log('[+] LDP accept4:     ' + findLdpSym('accept4'));
+console.log('[+] LDP connect:     ' + findLdpSym('connect'));
+console.log('[+] LDP setsockopt:  ' + findLdpSym('setsockopt'));
+console.log('[+] LDP getsockopt:  ' + findLdpSym('getsockopt'));
+console.log('[+] LDP getsockname: ' + findLdpSym('getsockname'));
 
 /* ============================================================================
  * STEP 4: C errno helper
  * ============================================================================ */
 
 const errnoLocation = new NativeFunction(
-    Module.findExportByName(null, '__errno_location'), 'pointer', []
+    findExport('libc.so.6', '__errno_location'), 'pointer', []
 );
 
 function getCErrno() {
@@ -123,26 +210,96 @@ function getCErrno() {
 }
 
 /* ============================================================================
- * STEP 5: Go return value helper
+ * STEP 4b: Pre-cached Go error interface objects
  *
- * Go's syscall layer returns (r1, r2, errno) in (rax, rbx, rcx).
- * On success: rax=result, rbx=0, rcx=0
- * On error:   rax=-1, rbx=0, rcx=positive_errno
+ * Go's syscall package caches error interfaces for common errno values.
+ * Each is a 16-byte value: {itab_ptr, data_ptr}.
+ * We look them up by symbol name from the Go binary so we can return
+ * proper Go error interfaces instead of raw errno integers.
  * ============================================================================ */
 
-function setGoReturn(context, retval, result, syscallName) {
+var goErrSyms = {};
+var goErrnoItab = null;  // go:itab.syscall.Errno,error
+(function findGoErrSymbols() {
+    var wanted = ['syscall.errEAGAIN', 'syscall.errEINVAL', 'syscall.errENOENT',
+                  'go:itab.syscall.Errno,error'];
+    Process.getModuleByName(moduleName).enumerateSymbols().forEach(function(sym) {
+        if (wanted.indexOf(sym.name) !== -1) {
+            goErrSyms[sym.name] = sym.address;
+            console.log('[+] Found Go error symbol: ' + sym.name + ' @ ' + sym.address);
+        }
+    });
+    // go:itab.syscall.Errno,error is the itab for syscall.Errno as an error interface.
+    // We can construct any errno by using this itab + the errno value as data.
+    var itabSym = goErrSyms['go:itab.syscall.Errno,error'];
+    if (itabSym) goErrnoItab = itabSym;
+})();
+
+// Returns {itab, data} for a C errno value.
+// go:itab.syscall.Errno,error uses pointer receivers, so data must be a pointer to
+// a uintptr holding the errno value. We cache allocations per errno value.
+var _errnoDataCache = {};
+function goErrFromErrno(errno) {
+    if (goErrnoItab) {
+        // Allocate (or reuse) a persistent 8-byte slot for this errno value.
+        if (!_errnoDataCache[errno]) {
+            var slot = Memory.alloc(8);
+            slot.writeU64(errno);
+            _errnoDataCache[errno] = slot;
+        }
+        return { itab: goErrnoItab, data: _errnoDataCache[errno] };
+    }
+    // Fallback: use pre-cached error objects for known errnos.
+    var sym;
+    if (errno === 11)      sym = goErrSyms['syscall.errEAGAIN'];
+    else if (errno === 22) sym = goErrSyms['syscall.errEINVAL'];
+    else if (errno === 2)  sym = goErrSyms['syscall.errENOENT'];
+    else                   sym = goErrSyms['syscall.errEINVAL'];
+    if (!sym) return { itab: ptr(0), data: ptr(0) };
+    return { itab: sym.readPointer(), data: sym.add(8).readPointer() };
+}
+
+/* ============================================================================
+ * STEP 5: Go return value helper
+ *
+ * Go's register ABI uses different return registers depending on the Go
+ * function signature:
+ *
+ *   func f() (int, error)  → rax=int, rbx=err.itab, rcx=err.data
+ *   func f() error         → rax=err.itab, rbx=err.data
+ *
+ * Use returnsInt=true for socket/accept4 (return fd + error),
+ * returnsInt=false for bind/listen/connect/setsockopt/getsockopt/getsockname
+ * (return error only).
+ * ============================================================================ */
+
+function setGoReturn(context, retval, result, syscallName, returnsInt) {
     if (result < 0) {
-        // C function returned -1; read errno from thread-local storage
         var errno = getCErrno();
+        var goErr = goErrFromErrno(errno);
         console.log('[!] ' + syscallName + ' failed: ret=' + result + ', errno=' + errno);
-        retval.replace(-1);
-        context.rbx = ptr(0);
-        context.rcx = ptr(errno);
+        if (returnsInt) {
+            // (int, error): rax=fd, rbx=err.itab, rcx=err.data
+            retval.replace(-1);
+            context.rbx = goErr.itab;
+            context.rcx = goErr.data;
+        } else {
+            // error: rax=err.itab, rbx=err.data
+            retval.replace(goErr.itab);
+            context.rbx = goErr.data;
+            context.rcx = ptr(0);
+        }
     } else {
         console.log('[+] ' + syscallName + ' succeeded: ret=' + result);
-        retval.replace(result);
-        context.rbx = ptr(0);   // second return value = 0
-        context.rcx = ptr(0);   // errno = 0 (no error)
+        if (returnsInt) {
+            retval.replace(result);
+            context.rbx = ptr(0);
+            context.rcx = ptr(0);
+        } else {
+            retval.replace(0);   // nil error.itab → err == nil
+            context.rbx = ptr(0);
+            context.rcx = ptr(0);
+        }
     }
 }
 
@@ -213,8 +370,17 @@ function allocateRetTrampoline() {
             console.log('[>] socket(' + this._domain + ', ' + this._type + ', ' + this._protocol + ')');
         },
         onLeave: function(retval) {
+            // Skip MPTCP sockets (proto=262=IPPROTO_MPTCP) — VPP doesn't support MPTCP.
+            // Return EPROTONOSUPPORT so Go falls back to regular TCP.
+            if (this._protocol === 262) {
+                retval.replace(-1);
+                this.context.rbx = goErrFromErrno(93 /*EPROTONOSUPPORT*/).itab;
+                this.context.rcx = goErrFromErrno(93).data;
+                console.log('[>] socket proto=MPTCP: returning EPROTONOSUPPORT');
+                return;
+            }
             var ret = ldp.socket(this._domain, this._type, this._protocol);
-            setGoReturn(this.context, retval, ret, 'socket');
+            setGoReturn(this.context, retval, ret, 'socket', true);
         }
     });
     console.log('[+] Hooked syscall.socket');
@@ -238,7 +404,7 @@ function allocateRetTrampoline() {
         },
         onLeave: function(retval) {
             var ret = ldp.bind(this._fd, ptr(this._addr.toString()), this._addrlen);
-            setGoReturn(this.context, retval, ret, 'bind');
+            setGoReturn(this.context, retval, ret, 'bind', false);
         }
     });
     console.log('[+] Hooked syscall.bind');
@@ -260,8 +426,15 @@ function allocateRetTrampoline() {
             console.log('[>] listen(' + this._fd + ', ' + this._backlog + ')');
         },
         onLeave: function(retval) {
+            // Disable IPv6 dual-stack before listen to prevent VPP LDP from
+            // creating a companion IPv4 session that fails with EADDRINUSE.
+            var v6onlyBuf = Memory.alloc(4);
+            v6onlyBuf.writeInt(1);
+            ldp.setsockopt(this._fd, 41 /*IPPROTO_IPV6*/, 26 /*IPV6_V6ONLY*/, v6onlyBuf, 4);
             var ret = ldp.listen(this._fd, this._backlog);
-            setGoReturn(this.context, retval, ret, 'listen');
+            var errno = getCErrno();
+            console.log('[dbg] listen(' + this._fd + ',' + this._backlog + ') ret=' + ret + ' errno=' + errno);
+            setGoReturn(this.context, retval, ret, 'listen', false);
         }
     });
     console.log('[+] Hooked syscall.Listen');
@@ -285,7 +458,7 @@ function allocateRetTrampoline() {
         },
         onLeave: function(retval) {
             var ret = ldp.getsockname(this._fd, ptr(this._addr.toString()), ptr(this._addrlenPtr.toString()));
-            setGoReturn(this.context, retval, ret, 'getsockname');
+            setGoReturn(this.context, retval, ret, 'getsockname', false);
         }
     });
     console.log('[+] Hooked syscall.getsockname');
@@ -309,7 +482,12 @@ function allocateRetTrampoline() {
         },
         onLeave: function(retval) {
             var ret = ldp.connect(this._fd, ptr(this._addr.toString()), this._addrlen);
-            setGoReturn(this.context, retval, ret, 'connect');
+            var e = getCErrno();
+            if (ret === -1 && (e === 115 /*EINPROGRESS*/ || e === 114 /*EALREADY*/)) {
+                console.log('[dbg] connect EINPROGRESS → treating as success (VCL async)');
+                ret = 0;
+            }
+            setGoReturn(this.context, retval, ret, 'connect', false);
         }
     });
     console.log('[+] Hooked syscall.connect');
@@ -337,7 +515,7 @@ function allocateRetTrampoline() {
         onLeave: function(retval) {
             var ret = ldp.setsockopt(this._fd, this._level, this._optname,
                                      ptr(this._optval.toString()), this._optlen);
-            setGoReturn(this.context, retval, ret, 'setsockopt');
+            setGoReturn(this.context, retval, ret, 'setsockopt', false);
         }
     });
     console.log('[+] Hooked syscall.setsockopt');
@@ -365,7 +543,7 @@ function allocateRetTrampoline() {
         onLeave: function(retval) {
             var ret = ldp.getsockopt(this._fd, this._level, this._optname,
                                      ptr(this._optval.toString()), ptr(this._optlenPtr.toString()));
-            setGoReturn(this.context, retval, ret, 'getsockopt');
+            setGoReturn(this.context, retval, ret, 'getsockopt', false);
         }
     });
     console.log('[+] Hooked syscall.getsockopt');
@@ -395,12 +573,104 @@ function allocateRetTrampoline() {
                         this._addrlenPtr + ', ' + this._flags + ')');
         },
         onLeave: function(retval) {
-            var ret = ldp.accept4(this._fd, ptr(this._addr.toString()),
+            // Blocking accept: spin-wait on EAGAIN so Go never needs epoll on VCL fds.
+            var ret;
+            do {
+                ret = ldp.accept4(this._fd, ptr(this._addr.toString()),
                                   ptr(this._addrlenPtr.toString()), this._flags);
-            setGoReturn(this.context, retval, ret, 'accept4');
+                if (ret === -1 && getCErrno() === 11 /*EAGAIN*/) {
+                    // 1ms busy-wait before retry
+                    var deadline = Date.now() + 1;
+                    while (Date.now() < deadline) {}
+                }
+            } while (ret === -1 && getCErrno() === 11);
+            setGoReturn(this.context, retval, ret, 'accept4', true);
         }
     });
     console.log('[+] Hooked syscall.accept4');
+})();
+
+// --- read(fd, buf, count) → int ---
+// syscall.read(fd int, p []byte) (n int, err error)
+// Go ABI: rax=fd, rbx=p.ptr, rcx=p.len
+(function hookRead() {
+    var addr = syscallAddresses['syscall.read'];
+    if (!addr) { console.log('[-] syscall.read not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd  = this.context.rax.toInt32();
+            this._buf = this.context.rbx;
+            this._len = this.context.rcx.toInt32();
+        },
+        onLeave: function(retval) {
+            // Blocking read: retry on EAGAIN (VCL non-blocking sessions).
+            var ret;
+            do {
+                ret = ldp.read(this._fd, ptr(this._buf.toString()), this._len);
+                if (ret === -1 && getCErrno() === 11) {
+                    var deadline = Date.now() + 1;
+                    while (Date.now() < deadline) {}
+                }
+            } while (ret === -1 && getCErrno() === 11);
+            setGoReturn(this.context, retval, ret, 'read', true);
+        }
+    });
+    console.log('[+] Hooked syscall.read');
+})();
+
+// --- write(fd, buf, count) → int ---
+// syscall.write(fd int, p []byte) (n int, err error)
+(function hookWrite() {
+    var addr = syscallAddresses['syscall.write'];
+    if (!addr) { console.log('[-] syscall.write not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd  = this.context.rax.toInt32();
+            this._buf = this.context.rbx;
+            this._len = this.context.rcx.toInt32();
+        },
+        onLeave: function(retval) {
+            var ret = ldp.write(this._fd, ptr(this._buf.toString()), this._len);
+            if (ret === -1 && getCErrno() === 11) {
+                // Retry once on EAGAIN
+                var deadline = Date.now() + 5;
+                while (Date.now() < deadline) {}
+                ret = ldp.write(this._fd, ptr(this._buf.toString()), this._len);
+            }
+            setGoReturn(this.context, retval, ret, 'write', true);
+        }
+    });
+    console.log('[+] Hooked syscall.write');
+})();
+
+// --- close(fd) → error ---
+// syscall.Close(fd int) error
+// Go ABI: rax=fd → returns rax=err.itab, rbx=err.data
+(function hookClose() {
+    var addr = syscallAddresses['syscall.Close'];
+    if (!addr) { console.log('[-] syscall.Close not found'); return; }
+
+    var trampoline = allocateRetTrampoline();
+    Interceptor.replace(addr, trampoline);
+
+    Interceptor.attach(addr, {
+        onEnter: function(args) {
+            this._fd = this.context.rax.toInt32();
+        },
+        onLeave: function(retval) {
+            var ret = ldp.close(this._fd);
+            setGoReturn(this.context, retval, ret, 'close', false);
+        }
+    });
+    console.log('[+] Hooked syscall.Close');
 })();
 
 /* ============================================================================
@@ -409,3 +679,4 @@ function allocateRetTrampoline() {
 
 console.log('[+] All hooks installed. Go syscalls will be redirected to VCL.');
 console.log('[+] Ensure VCL_CONFIG is set in the environment.');
+}

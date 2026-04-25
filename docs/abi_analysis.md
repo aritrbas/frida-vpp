@@ -451,3 +451,344 @@ Required return    0      0       0       ?      ?      ?      ?     ?     ?
 | Global mutable state for call dispatch | Race conditions under concurrent goroutines | `experiments/interceptor_server_v1.js`, `experiments/interceptor_client_v1.js` |
 | Blocking `accept4` in Frida JS thread | Frida event loop freezes | `experiments/interceptor_full_attempt.js`, `experiments/interceptor_server_v1.js` |
 | `prepRegs` only shuffles, doesn't call LDP | Two-step approach leaves return value undefined | All prepRegs-based approaches |
+
+---
+
+## 11. Frida 17 API Changes and Their Impact
+
+Frida 17 introduced several breaking API changes that affected the working interceptors. Understanding these is necessary to maintain compatibility.
+
+### Enumerate APIs Now Return Arrays
+
+The callback-based `{onMatch, onComplete}` style is gone. Old scripts that called:
+```js
+Module.enumerateSymbols('echo_server', { onMatch: fn, onComplete: fn });
+```
+silently found zero symbols — no error, just no results. The fix:
+```js
+Process.getModuleByName('echo_server').enumerateSymbols().forEach(function(sym) { ... });
+```
+
+### `Module.findExportByName()` Static Form Removed
+
+Old code `Module.findExportByName('libc.so.6', 'getenv')` now throws `TypeError`. The working interceptors use a `findExport()` helper:
+```js
+function findExport(modName, symName) {
+    var mod = Process.findModuleByName(modName);
+    if (!mod) {
+        var addr = null;
+        Process.enumerateModules().some(function(m) {
+            var a = m.findExportByName(symName);
+            if (a) { addr = a; return true; }
+            return false;
+        });
+        return addr;
+    }
+    return mod.findExportByName(symName);
+}
+```
+
+### `Process.getEnvironmentVariable()` Removed
+
+This function does not exist in Frida 17. The working interceptors read environment variables via libc's `getenv`:
+```js
+var _getenv = new NativeFunction(
+    findExport('libc.so.6', 'getenv'), 'pointer', ['pointer']
+);
+function getEnv(name) {
+    var p = _getenv(Memory.allocUtf8String(name));
+    return p.isNull() ? null : p.readUtf8String();
+}
+```
+
+### Correct Go Error Interface Return (Updated — Session 2)
+
+The earlier understanding "set `rcx = errno_int`" was wrong for the Go error interface. The `syscall` package's higher-level functions (`syscall.socket`, `syscall.bind`, etc.) return Go `error` interface values, not raw integers. The interface has two pointer fields: `itab` and `data`.
+
+**Session 2 correction:** The pre-cached `syscall.errEAGAIN/errEINVAL/errENOENT` objects only cover three errno values. For arbitrary errno values, use `go:itab.syscall.Errno,error`:
+
+```js
+// go:itab.syscall.Errno,error is the interface table for syscall.Errno as error
+var goErrnoItab = goErrSyms['go:itab.syscall.Errno,error'];
+
+// CRITICAL: syscall.Errno methods use POINTER receivers.
+// Therefore: interface.data must be a POINTER to the errno value, not inline.
+function goErrFromErrno(errno) {
+    if (!_errnoDataCache[errno]) {
+        var slot = Memory.alloc(8);   // persistent 8-byte allocation
+        slot.writeU64(errno);          // write errno value into slot
+        _errnoDataCache[errno] = slot;
+    }
+    return { itab: goErrnoItab, data: _errnoDataCache[errno] };
+    //                                      ↑ pointer to errno, not errno itself
+}
+```
+
+**Why pointer is required:**
+```go
+// Go source: syscall/types_linux.go
+type Errno uintptr
+
+// Error method has POINTER receiver:
+func (e *Errno) Error() string {
+    // *e is the errno value (dereferences the pointer)
+    if 0 <= int(*e) && int(*e) < len(errorTable) { ... }
+}
+```
+
+When Go calls `err.Error()`, it dereferences the data pointer as `*Errno`. If data=9 (inline integer, not a pointer), it tries to dereference address 0x9 → segfault.
+
+### `--no-pause` Flag Removed
+
+Frida 17 auto-resumes the target by default. All run commands should omit `--no-pause`:
+```bash
+# Frida 17+
+frida ./test/echo_server -l interceptor_server.js
+```
+
+---
+
+## 12. Session 2 Discoveries — VCL Fake FD Architecture
+
+### 12.1 LDP Fake File Descriptor Numbers
+
+VPP's LDP does not use real kernel file descriptors for VCL sessions. Instead, it maintains a mapping:
+
+```
+VCL session handle (vlsh) → fake fd = vlsh + vlsh_bit_val
+
+Default vlsh_bit_val = (1 << LDP_SID_BIT_MIN) = (1 << 5) = 32
+```
+
+So the first VCL socket returns fd=32, the second returns fd=33, etc.
+
+**Impact on interception:**
+- `ldp.socket()` returns 32, not 3 or 4 like kernel sockets
+- `ldp.accept4()` returns 33, 34, etc. for connected sessions
+- These fd numbers exist ONLY in LDP's internal table — the kernel knows nothing about them
+- Any Go code that calls the kernel with fd=32 gets EBADF
+
+**The complete set of syscalls that must be hooked:**
+
+| Syscall | Why hook it |
+|---------|-------------|
+| `socket` | Gets initial VCL fd (=32) |
+| `bind` | Routes through LDP using VCL fd |
+| `listen` | Routes through LDP |
+| `accept4` | Returns new VCL fd (=33+) for each connection |
+| `connect` | Routes through LDP |
+| `setsockopt` / `getsockopt` / `getsockname` | Routes through LDP |
+| **`read`** | **VCL fd≥32 → kernel EBADF without this hook** |
+| **`write`** | **VCL fd≥32 → kernel EBADF without this hook** |
+| **`close`** | **VCL fd≥32 → kernel EBADF without this hook** |
+
+### 12.2 LDP FD Dispatch Logic
+
+```c
+// LDP routes based on fd value:
+static vls_handle_t ldp_fd_to_vlsh(int fd) {
+    if (fd < ldp->vlsh_bit_val) {
+        return VLS_INVALID_HANDLE;  // → libc kernel path
+    }
+    return (fd - ldp->vlsh_bit_val);  // → VCL session path
+}
+```
+
+In practice:
+- `ldp.read(fd=5, ...)` → `fd < 32` → `libc_read(5, ...)` (kernel passthrough)
+- `ldp.read(fd=32, ...)` → `fd ≥ 32` → `vls_read(vlsh=0, ...)` (VCL path)
+- `ldp.read(fd=33, ...)` → `fd ≥ 32` → `vls_read(vlsh=1, ...)` (VCL path)
+
+### 12.3 VPPCOM_ATTR_GET_ERROR Stub
+
+`getsockopt(SO_ERROR)` on a VCL fd always returns 0, regardless of actual session state:
+
+```c
+// vppcom.c
+case VPPCOM_ATTR_GET_ERROR:
+    if (buffer && buflen && (*buflen >= sizeof (int))) {
+        *(int *) buffer = 0;   // ← ALWAYS ZERO, unconditionally
+        *buflen = sizeof (int);
+        VDBG (2, "VPPCOM_ATTR_GET_ERROR: %d, buflen %d, #VPP-TBD#", ...);
+        //                                                  ↑ marked as TODO
+    }
+```
+
+This makes the standard POSIX pattern for non-blocking connect detection impossible:
+```js
+// DOES NOT WORK with VCL:
+while (getsockopt(SO_ERROR) === EINPROGRESS) { poll/sleep; }
+```
+
+### 12.4 VCL Session States for connect
+
+```
+vppcom_session_connect() with VCL_SESS_ATTR_NONBLOCK set:
+    → Sends connect request to VPP
+    → Sets session state to VCL_STATE_UPDATED
+    → Returns VPPCOM_EINPROGRESS immediately
+
+Session state transitions:
+    VCL_STATE_UPDATED (connecting)
+    → [VPP processes SYN, responds]
+    → VCL_STATE_READY (connected)
+
+vcl_session_write_ready() returns:
+    VCL_STATE_READY:   → svm_fifo_max_enqueue_prod() > 0 (positive)
+    VCL_STATE_UPDATED: → 0 (not writable yet)
+    Other states:      → VPPCOM_ENOTCONN (negative)
+```
+
+**Consequence:** `ldp.poll(POLLOUT)` works correctly — when session transitions to `VCL_STATE_READY`, poll returns POLLOUT. BUT calling `ldp.poll` from Frida's JS thread freezes the entire Frida event loop (see section 12.5).
+
+### 12.5 Blocking LDP Calls from Frida JS Thread
+
+**Critical constraint:** The Frida JS engine runs on a single thread. All `onEnter`/`onLeave` hooks share this thread. If any hook calls a blocking function (accept4, read, poll), ALL other hooks are frozen until it returns.
+
+```
+Frida JS thread timeline:
+
+    hookSocket.onLeave  ── fast (ldp.socket returns immediately)  ──→ done
+    hookBind.onLeave    ── fast ──────────────────────────────────→ done
+    hookListen.onLeave  ── fast ──────────────────────────────────→ done
+    hookAccept4.onLeave ── BLOCKS (waiting for client connection) ─→ ...
+                           [While blocked: no other hooks can fire]
+                           [No getsockname, setsockopt, etc.]
+    hookRead.onLeave    ── BLOCKS on EAGAIN retry ─────────────────→ ...
+```
+
+**Mitigations used:**
+- **accept4:** Blocking is acceptable here — Go only calls accept4 once per connection, and the spin-wait with 1ms sleep is functionally equivalent to a blocking accept.
+- **read (server):** Spin-wait with 1ms sleep on EAGAIN. Acceptable because VCL data delivery is fast once the session is established.
+- **read (client — Session 3 fix):** `ldp.epoll_wait(EPOLLIN, 5s)` to drain the VCL MQ and wait for data. See Section 12.9.
+- **write (client — Session 3 fix):** `ldp.epoll_wait(EPOLLOUT, 5s)` on EAGAIN/ENOTCONN for VCL fds.
+- **connect (EINPROGRESS — Session 3 fix):** `ldp.epoll_wait(EPOLLOUT, 5s)` to wait for session READY. Do NOT call ldp.poll (blocks indefinitely). Do NOT return EINPROGRESS to Go (Go's runtime poller uses raw syscalls that bypass LDP). See Section 12.9.
+
+### 12.6 Go MPTCP Support (Go 1.21+)
+
+Go 1.21+ added MPTCP support. When `net.Listen("tcp", ...)` is called, Go also tries:
+```
+socket(AF_INET6, SOCK_STREAM, IPPROTO_MPTCP=262)
+```
+in addition to the regular TCP socket. Both attempts are non-fatal: if MPTCP socket fails, Go falls back.
+
+**VPP impact:** LDP receives both socket calls. VPP doesn't support MPTCP over VCL. The MPTCP socket creates a VCL session (proto=TCP internally), and both sessions compete to bind/listen on port 9876 → second listen fails with EADDRINUSE.
+
+**Fix:** In socket `onLeave`, detect proto=262 and return EPROTONOSUPPORT. Go's MPTCP fallback handles this gracefully.
+
+### 12.7 IPv6 Dual-Stack and VPP
+
+Go's `net.Listen("tcp", ":9876")` uses `[::]:9876` (IPv6 address). By default, Linux IPv6 sockets have dual-stack enabled (IPV6_V6ONLY=0), meaning the socket also accepts IPv4 connections.
+
+**VPP behavior:** When VCL receives a bind on `[::]`, with dual-stack enabled it attempts to create both an IPv6 AND an IPv4 listener on the same port. The second `vppcom_session_listen()` call fails with VPPCOM_EADDRINUSE.
+
+**Fix:** Before calling `ldp.listen()`, set `IPV6_V6ONLY=1`:
+```js
+ldp.setsockopt(this._fd, 41 /*IPPROTO_IPV6*/, 26 /*IPV6_V6ONLY*/, v6onlyBuf, 4);
+ldp.listen(this._fd, this._backlog);
+```
+
+### 12.8 Go Binary Symbol Addresses (echo_server, Go 1.24.4 linux/amd64)
+
+```
+Symbol                        Address     Args (Go ABI)
+──────────────────────────────────────────────────────────────────────────
+syscall.socket                0x48ff40    rax=domain, rbx=type, rcx=proto
+syscall.bind                  0x48fc00    rax=fd, rbx=addr_ptr, rcx=addrlen
+syscall.Listen                0x48f960    rax=fd, rbx=backlog
+syscall.accept4               0x48fb00    rax=fd, rbx=addr_ptr, rcx=addrlen_ptr, rdi=flags
+syscall.connect               0x48fce0    rax=fd, rbx=addr_ptr, rcx=addrlen
+syscall.getsockname           0x490100    rax=fd, rbx=addr_ptr, rcx=addrlen_ptr
+syscall.getsockopt            0x4907c0    rax=fd, rbx=level, rcx=optname, rdi=optval_ptr, rsi=optlen_ptr
+syscall.setsockopt            0x4908c0    rax=fd, rbx=level, rcx=optname, rdi=optval_ptr, rsi=optlen
+syscall.read                  0x48f520    rax=fd, rbx=buf_ptr, rcx=buf_len
+syscall.write                 0x48f6e0    rax=fd, rbx=buf_ptr, rcx=buf_len
+syscall.Close                 0x48f280    rax=fd
+go:itab.syscall.Errno,error   0x5489d8    (itab pointer for error interface)
+```
+
+Note: `syscall.read` and `syscall.write` take `[]byte` slice as arg2/arg3:
+- Go slice layout: `{ptr, len, cap}` in consecutive argument registers
+- For `read(fd, p []byte)`: rax=fd, rbx=p.ptr, rcx=p.len, rdi=p.cap
+- We only need ptr and len for the C call; cap is ignored
+
+---
+
+## 13. Session 3 Discoveries — VCL Message Queue and epoll_wait
+
+### 13.1 VCL Message Queue (MQ) Starvation
+
+**Critical discovery:** `vppcom_session_write()` and `vppcom_session_read()` do NOT process the VCL worker's message queue (MQ). When VPP completes an async operation (e.g., TCP handshake), it places the result (e.g., `SESSION_CONNECTED`) in the worker's MQ. If no MQ-draining function is called, the event stays unread and the session state never transitions.
+
+**Functions that DO process the MQ:**
+- `vppcom_epoll_wait()` → calls `vcl_epoll_wait_handle_mq()`
+- `vppcom_select()` → processes MQ internally
+
+**Functions that do NOT process the MQ:**
+- `vppcom_session_read()` — only checks `session->session_state`
+- `vppcom_session_write()` — only checks `vcl_session_write_ready()`
+
+**Consequence for Frida hooks:** Spin-waiting on `ldp.read()` or `ldp.write()` EAGAIN/ENOTCONN retries never makes progress because the session state transition event is stuck in the MQ. The session remains in `VCL_STATE_UPDATED` forever.
+
+### 13.2 LDP epoll_wait as MQ Pump Pattern
+
+The fix for all blocking VCL I/O from Frida hooks is to use `ldp.epoll_wait()` which routes through `vppcom_epoll_wait()` and processes the MQ:
+
+```javascript
+// Generic pattern:
+function waitForVclEvent(fd, epollEvents, timeoutMs) {
+    var epfd = ldp.epoll_create1(0);
+    if (epfd < 0) return -1;
+    var ev = Memory.alloc(12);
+    ev.writeU32(epollEvents);  // EPOLLIN=0x01, EPOLLOUT=0x04
+    ev.add(4).writeU32(fd);
+    ldp.epoll_ctl(epfd, 1 /*ADD*/, fd, ev);
+    var events = Memory.alloc(12);
+    var n = ldp.epoll_wait(epfd, events, 1, timeoutMs);
+    ldp.close(epfd);
+    return n;  // >0 = event fired, 0 = timeout, <0 = error
+}
+
+// Usage:
+// connect: waitForVclEvent(fd, 0x04 /*EPOLLOUT*/, 5000)
+// read:    waitForVclEvent(fd, 0x01 /*EPOLLIN*/,  5000)
+// write:   waitForVclEvent(fd, 0x04 /*EPOLLOUT*/, 5000)
+```
+
+**Why this works and ldp.poll() doesn't:**
+- `ldp.epoll_wait()` is implemented as a busy-poll internally with short timeouts, checking the MQ between iterations
+- `ldp.poll()` also works in principle but blocks the Frida JS thread completely (no yield)
+- Both process the MQ, but `epoll_wait` with a bounded timeout is safer from Frida's event loop perspective
+
+### 13.3 Go Runtime Poller Bypasses LDP (Cannot Delegate Async I/O to Go)
+
+Go's runtime poller (`runtime/netpoll_epoll.go`) uses raw `SYSCALL` instructions for `epoll_create1`, `epoll_ctl`, and `epoll_pwait`. These bypass LDP's `LD_PRELOAD` interception entirely.
+
+```
+Go runtime poller:
+  epoll_create1() → raw syscall → kernel epoll fd
+  epoll_ctl(ADD, fd=32) → raw syscall → kernel: fd=32 doesn't exist → EBADF
+```
+
+This means:
+- Cannot pass EINPROGRESS to Go — the runtime poller can't register VCL fake fds
+- Cannot use Go's built-in non-blocking I/O for VCL sessions
+- All async waiting must be done in the Frida JS hooks via `ldp.epoll_*`
+- This is why `accept4` must be made blocking in the hook (Go's poller path doesn't work for VCL fds)
+
+### 13.4 IPv4/IPv6 Mismatch in VPP Session Lookup
+
+VPP's session lookup does not match IPv4 connect requests against IPv6 listeners:
+
+```
+Server: socket(AF_INET6) → bind([::]:9876) → listen()
+  → VPP creates transport endpoint: [::]:9876 (IPv6)
+
+Client: socket(AF_INET) → connect(127.0.0.1:9876)
+  → VPP looks for: 127.0.0.1:9876 (IPv4)
+  → No match! → "connect failed! no route"
+```
+
+Go's `net.Listen("tcp", "0.0.0.0:9876")` creates an AF_INET6 socket (even with an IPv4 address!) because Go prefers dual-stack. The fix is to use `"tcp4"` to force AF_INET in both server and client.
+
+Unlike the Linux kernel (which maps IPv4 connections to `[::]` listeners via `::ffff:127.0.0.1`), VPP treats IPv4 and IPv6 as separate transport spaces with no mapping between them.

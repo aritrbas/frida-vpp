@@ -29,7 +29,9 @@ func main() {
 	fmt.Println("[server] Starting echo server on", addr)
 
 	// This triggers: syscall.socket, syscall.setsockopt, syscall.bind, syscall.Listen, syscall.getsockname
-	ln, err := net.Listen("tcp", addr)
+	// Use "tcp4" to force IPv4 — VPP's session lookup table doesn't match
+	// IPv4 connect requests against IPv6 listeners.
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[server] Listen error: %v\n", err)
 		os.Exit(1)

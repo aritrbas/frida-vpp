@@ -384,10 +384,361 @@ The global `isPrepRegsFunctionAttached` flag races under Go's concurrent gorouti
 
 ## Working Solution
 
-The corrected interceptors (`interceptor_server.js` and `interceptor_client.js` at the repo root) fix all three bugs:
+The corrected interceptors (`interceptor_server.js` and `interceptor_client.js` at the repo root) fix all three bugs, plus the Frida 17 compatibility issues described below:
 
-1. **Return values:** Always sets `rbx=0, rcx=0` on success, `rbx=0, rcx=errno` on error.
+1. **Return values:** On success, always set `rbx=0, rcx=0`. On error, use pre-cached Go error interface objects (`syscall.errEAGAIN`, `syscall.errEINVAL`, `syscall.errENOENT`): for `socket`/`accept4` (which return `(fd, error)`) set `rax=-1, rbx=err.itab, rcx=err.data`; for `bind`/`listen`/etc. (which return only `error`) set `rax=err.itab, rbx=err.data`.
 2. **Thread safety:** Uses per-invocation `this._xxx` state instead of global flags.
 3. **No assembly shim needed:** Uses `Memory.alloc` + `X86Writer` to create a minimal `ret` trampoline, reads Go ABI registers in `onEnter`, calls LDP in `onLeave`.
+4. **Conditional VCL loading:** VCL (`libvcl_ldpreload.so`) is only loaded when `VCL_CONFIG` env var is set, preventing crashes in passthrough mode.
 
 See `docs/abi_analysis.md` for the detailed register-level explanation.
+
+---
+
+## Frida 17 API Breaking Changes (Additional Failures)
+
+During debugging with Frida 17.9.1, several additional failures were caused by API changes from Frida 16. These would affect any older script even if the logic were otherwise correct.
+
+### Removed: Callback-Based Enumerate APIs
+
+**Frida ≤16:**
+```js
+Module.enumerateSymbols('echo_server', { onMatch: function(sym) { ... }, onComplete: function() {} });
+Process.enumerateModules({ onMatch: function(m) { ... }, onComplete: function() {} });
+```
+
+**Frida 17:** Both APIs now return arrays directly. The callback form silently does nothing (no error, no symbols found):
+```js
+Process.getModuleByName('echo_server').enumerateSymbols().forEach(function(sym) { ... });
+Process.enumerateModules().forEach(function(m) { ... });
+```
+
+**Symptom:** No symbols found → all hooks silently skipped → binary runs unhooked.
+
+---
+
+### Removed: `Module.findExportByName()` Static Form
+
+**Frida ≤16:**
+```js
+var addr = Module.findExportByName('libc.so.6', 'getenv');
+var addr = Module.findExportByName(null, 'socket'); // search all modules
+```
+
+**Frida 17:** The static form is removed entirely. Must use instance method:
+```js
+var addr = Process.findModuleByName('libc.so.6').findExportByName('getenv');
+// or to search all modules:
+var addr = null;
+Process.enumerateModules().some(function(m) {
+    var a = m.findExportByName('socket');
+    if (a) { addr = a; return true; }
+    return false;
+});
+```
+
+The scripts use a `findExport(modName, symName)` helper that encapsulates this pattern.
+
+**Symptom:** `TypeError: Module.findExportByName is not a function` at script load time, preventing any hooks from being installed.
+
+---
+
+### Removed: `Process.getEnvironmentVariable()`
+
+**Frida ≤16:**
+```js
+var val = Process.getEnvironmentVariable('VCL_CONFIG');
+```
+
+**Frida 17:** This function does not exist. Must call libc's `getenv` directly:
+```js
+var _getenv = new NativeFunction(
+    Process.findModuleByName('libc.so.6').findExportByName('getenv'),
+    'pointer', ['pointer']
+);
+function getEnv(name) {
+    var p = _getenv(Memory.allocUtf8String(name));
+    return p.isNull() ? null : p.readUtf8String();
+}
+```
+
+**Symptom:** `TypeError: Process.getEnvironmentVariable is not a function` at script load time.
+
+---
+
+### Removed: `--no-pause` CLI Flag
+
+**Frida ≤16:**
+```bash
+frida ./echo_server -l interceptor_server.js --no-pause
+```
+
+**Frida 17:** The `--no-pause` flag is removed; auto-resume is now the default. Passing `--no-pause` causes:
+```
+Error: unknown option '--no-pause'
+```
+
+**Fix:** Simply omit the flag:
+```bash
+frida ./echo_server -l interceptor_server.js
+```
+
+---
+
+### Subtle: `Module.findExportByName(null, sym)` Returns `null` at Spawn Time
+
+Even though Frida 16's `null`-module-name search worked at runtime, at process spawn time (before all libraries are mapped) it can return `null` even for `libc.so.6` symbols. The fix is to always specify the module name explicitly:
+```js
+// Fragile at spawn time:
+var addr = Process.enumerateModules().some(function(m) { ... }); // may not find libc yet
+// Robust:
+var addr = Process.findModuleByName('libc.so.6').findExportByName('getenv');
+```
+
+---
+
+## Session 2 Failed Attempts
+
+After achieving a working `listen()`, additional bugs were discovered and multiple approaches were tried and discarded before finding working solutions. This section documents those failed attempts.
+
+### S2-1: connect EINPROGRESS — SO_ERROR Polling Loop (FAILED)
+
+**Context:** `ldp.connect()` returns `-1` with `errno=EINPROGRESS` (115) for VCL non-blocking connect. The standard POSIX approach is to poll `SO_ERROR` until it changes from `EINPROGRESS` to 0 (connected) or another error.
+
+**Attempt:**
+```js
+onLeave: function(retval) {
+    var ret = ldp.connect(this._fd, ptr(this._addr.toString()), this._addrlen);
+    var e = getCErrno();
+    if (ret === -1 && e === 115) {
+        // Poll SO_ERROR until connected
+        var errBuf = Memory.alloc(4);
+        var errLenBuf = Memory.alloc(4);
+        errLenBuf.writeInt(4);
+        var maxIter = 50000;
+        var soErr = 115;
+        while (soErr === 115 && maxIter-- > 0) {
+            ldp.getsockopt(this._fd, 1 /*SOL_SOCKET*/, 4 /*SO_ERROR*/, errBuf, errLenBuf);
+            soErr = errBuf.readInt();
+        }
+        // Now soErr should be 0 (connected) or real error
+        if (soErr !== 0) {
+            ret = -1;
+            e = soErr;
+        } else {
+            ret = 0;
+        }
+    }
+    setGoReturn(this.context, retval, ret, 'connect', false);
+}
+```
+
+**Why it failed:** `VPPCOM_ATTR_GET_ERROR` in VPP is an unimplemented stub:
+```c
+// vppcom.c — marked #VPP-TBD#
+case VPPCOM_ATTR_GET_ERROR:
+    if (buffer && buflen && (*buflen >= sizeof (int)))
+        *(int *) buffer = 0;   // ALWAYS returns 0
+```
+
+The loop exits in the first iteration with `soErr=0`, but the VCL session is still in `VCL_STATE_UPDATED` (not connected). When `ret=0` is returned to Go, Go proceeds with `write()` immediately. The VCL session isn't ready yet, so `ldp.write()` returns `ENOTCONN`. After 50000 iterations of polling (all returning 0 immediately), the approach was abandoned.
+
+**Error observed:** After the polling loop exited and returned success, Go's net package tried its own `getsockopt(SO_ERROR)` call on what it believed was a connected socket, getting: `getsockopt: socket operation on non-socket`. This crashed the connection attempt.
+
+---
+
+### S2-2: connect EINPROGRESS — ldp.poll(POLLOUT, 5000ms) (FAILED)
+
+**Attempt:** After discarding SO_ERROR polling, the next attempt was to use `ldp.poll()` with a large timeout (5 seconds) to wait for the VCL session to become POLLOUT-ready (indicating connection established).
+
+```js
+// Added ldp.poll to NativeFunction table:
+poll: new NativeFunction(findLdpSym('poll'), 'int', ['pointer', 'int', 'int']),
+
+// In connect onLeave:
+if (ret === -1 && e === 115) {
+    var pfd = Memory.alloc(8);
+    pfd.writeInt(this._fd);       // struct pollfd.fd
+    pfd.add(4).writeShort(4);    // struct pollfd.events = POLLOUT
+    pfd.add(6).writeShort(0);    // struct pollfd.revents
+    var pr = ldp.poll(pfd, 1, 5000);
+    if (pr > 0 && (pfd.add(6).readShort() & 4)) {
+        ret = 0;  // Connected
+    }
+}
+```
+
+**Why it failed:** `ldp.poll()` is a synchronous blocking call. Frida's JavaScript engine runs all hooks on a **single thread**. Calling `ldp.poll(5000ms)` from `onLeave` freezes the entire Frida JS event loop for up to 5 seconds.
+
+**Deadlock mechanism:**
+1. Client's `connect onLeave` calls `ldp.poll(POLLOUT, 5000)`.
+2. Frida JS thread is now blocked in `ldp.poll`.
+3. `ldp.poll` internally calls `vppcom_epoll_wait` waiting for VCL event.
+4. VCL processes events through its event queue (message queue + eventfd).
+5. VPP processes the SYN, sends SYN-ACK.
+6. LDP receives the VPP notification — but the Frida JS thread is blocked, so no VCL worker can process it.
+7. Timeout: `ldp.poll` returns 0 (timeout), with no POLLOUT ever received.
+8. Connect returns as failed → Go retries → deadlock.
+
+**Additional problem:** While the JS thread is blocked, **the server's `accept4` spin-wait is also frozen**. The server cannot process the incoming connection, so VPP has no peer to connect to, making even a non-deadlock scenario fail.
+
+**Verdict:** `ldp.poll` and any other blocking LDP functions must NEVER be called from Frida hook handlers (`onEnter`/`onLeave`).
+
+---
+
+### S2-3: Using Pre-Cached Go Error Objects for Arbitrary Errno (FAILED)
+
+**Context:** Early code used `syscall.errEAGAIN`, `syscall.errEINVAL`, `syscall.errENOENT` — pre-cached error interface objects in the Go binary. When MPTCP rejection required returning `EPROTONOSUPPORT` (93), the code tried to reuse these for other errno values.
+
+**Broken attempt:**
+```js
+// Try to construct a Go error interface inline for an arbitrary errno
+function goErrFromErrno(errno) {
+    // This approach: use the itab pointer + inline errno as data pointer
+    return { itab: goErrnoItab, data: ptr(errno) };
+}
+```
+
+**Why it failed:** `syscall.Errno` has pointer receiver methods:
+```go
+func (e *Errno) Error() string { ... }  // pointer receiver
+```
+
+In Go's interface layout with a pointer-receiver type:
+- `itab.fun[0]` (the `Error` method) receives `data` as the method receiver.
+- `data` must be a **pointer to the Errno value**.
+- `ptr(93)` = pointer to address 0x5d (93 decimal) — this is not a valid memory address.
+- When Go calls `err.Error()` to format the error message, it dereferences 0x5d → SEGFAULT or panic.
+
+**Observed error:** `panic: runtime error: invalid memory address or nil pointer dereference` inside Go's error formatting code.
+
+**Fix:** Allocate a persistent 8-byte slot for each errno value and use the slot's address as the data pointer (see section 12 in abi_analysis.md).
+
+---
+
+### S2-4: findLdpSym Using Exact Module Name (FAILED)
+
+**Context:** Initial code used `Process.findModuleByName('libvcl_ldpreload.so')` to find the LDP module after loading it.
+
+**Attempt:**
+```js
+Module.load('/path/to/libvcl_ldpreload.so');
+var ldpMod = Process.findModuleByName('libvcl_ldpreload.so');
+// → ldpMod is null!
+```
+
+**Why it failed:** On Linux, when a shared library has an embedded SONAME (e.g., `libvcl_ldpreload.so.26.06`), the dynamic linker registers the module under its SONAME, not the filename. `Process.findModuleByName()` matches by module name (SONAME), not path.
+
+Verified:
+```
+Process.enumerateModules().filter(m => m.name.includes('vcl'))
+→ [{ name: 'libvcl_ldpreload.so.26.06', path: '/path/to/libvcl_ldpreload.so', ... }]
+```
+
+**Fix:** Search all modules for 'ldpreload' as a path/name substring.
+
+---
+
+### Summary of Session 2 Failed Approaches
+
+| Attempt | Strategy | Why It Failed | Outcome |
+|---------|----------|---------------|---------|
+| S2-1 | SO_ERROR polling loop | VPPCOM_ATTR_GET_ERROR always returns 0 (VPP stub) | Abandoned after 50000 iterations |
+| S2-2 | ldp.poll(POLLOUT, 5000ms) | Blocks Frida JS thread; creates deadlock with accept4 spin-wait | Deadlock — server and client both frozen |
+| S2-3 | `ptr(errno)` as Go interface data | `syscall.Errno` has pointer receivers; 0x5d is not valid memory | panic/segfault in error formatting |
+| S2-4 | Exact module name lookup | Module registered under versioned SONAME `.so.26.06` | `null` module, all LDP functions fail to resolve |
+
+For details on what DID work, see [session2_debugging_report.md](session2_debugging_report.md).
+
+---
+
+## Session 3 Failed Approaches
+
+### S3-F1: connect EINPROGRESS → Return Success Immediately (Spin-Wait Read/Write)
+
+**Approach:**
+After `ldp.connect()` returns EINPROGRESS, immediately return success to Go. Rely on the read/write hooks to spin-wait on EAGAIN/ENOTCONN until the VCL session transitions to READY.
+
+```javascript
+// connect hook
+if (ret === -1 && (e === 115 || e === 114)) {
+    ret = 0;  // tell Go connect succeeded
+}
+
+// read/write hooks
+do {
+    ret = ldp.read(fd, buf, len);
+    if (ret === -1 && getCErrno() === 11 /*EAGAIN*/) {
+        var deadline = Date.now() + 1;
+        while (Date.now() < deadline) {}  // 1ms busy-wait
+    }
+} while (ret === -1 && getCErrno() === 11);
+```
+
+**Why it failed:** `vppcom_session_write()` and `vppcom_session_read()` do NOT process the VCL worker message queue (MQ). When VPP completes the TCP handshake, it puts `SESSION_CONNECTED` in the MQ. Without calling a function that drains the MQ, this event sits unread forever. The VCL session stays in `VCL_STATE_UPDATED` and never transitions to `VCL_STATE_READY`. The spin-wait loops run millions of iterations making no progress.
+
+**Symptoms:**
+- `ldp.write()` returns -1 with errno=107 (ENOTCONN) indefinitely
+- `ldp.read()` returns -1 with errno=11 (EAGAIN) indefinitely
+- VPP logs show `session 0 [0x2] connected` (VPP side completed), but VCL session state never updates
+
+**Fix:** Use `ldp.epoll_wait()` instead of spin-waiting. `epoll_wait` routes through `vppcom_epoll_wait()` which processes the MQ. See session2_debugging_report.md Section 2.8.
+
+---
+
+### S3-F2: connect EINPROGRESS → Pass EINPROGRESS to Go (Let Go Runtime Handle)
+
+**Approach:**
+Return EINPROGRESS to Go as a proper errno, letting Go's runtime poller handle the async connect completion via its built-in epoll mechanism.
+
+```javascript
+// connect hook — pass EINPROGRESS back to Go
+if (ret === -1 && (e === 115 || e === 114)) {
+    var goErr = goErrFromErrno(e);
+    retval.replace(goErr.itab);
+    this.context.rbx = goErr.data;
+}
+```
+
+**Why it failed:** Go's runtime poller uses raw `SYSCALL` instructions for `epoll_create1`, `epoll_ctl`, and `epoll_pwait` — not libc functions. LDP's `LD_PRELOAD` only intercepts libc symbols. So:
+
+1. Go receives EINPROGRESS → registers fd=32 for POLLOUT with the runtime poller
+2. Runtime poller calls `epoll_ctl(epfd, EPOLL_CTL_ADD, fd=32, ...)` via raw syscall
+3. Kernel: fd=32 doesn't exist (VCL fake fd) → `EBADF`
+4. Go falls back to polling `getsockopt(SO_ERROR)` in a loop
+5. Our `getsockopt` hook calls `ldp.getsockopt(SO_ERROR)` → VPP stub returns 0 always
+6. Go interprets 0 as "no error, not connected yet" → keeps polling forever
+
+**Symptoms:**
+- Massive `getsockopt(SO_ERROR)` spam (thousands of calls per second)
+- Client never makes progress
+- CPU at 100% in the polling loop
+
+**Fix:** Do not pass EINPROGRESS to Go. Handle the async connect entirely in the Frida hook using `ldp.epoll_wait(EPOLLOUT)`.
+
+---
+
+### S3-F3: IPv4 Client Connecting to IPv6 Server Listener
+
+**Approach:**
+Use Go's default `net.Listen("tcp", "0.0.0.0:9876")` (creates AF_INET6 socket, binds `[::]:9876`) with `net.Dial("tcp", "127.0.0.1:9876")` (creates AF_INET socket).
+
+**Why it failed:** VPP's session lookup table treats IPv4 and IPv6 as separate transport spaces. Unlike the Linux kernel (which maps IPv4 connections to `[::]` listeners via `::ffff:` mapping), VPP does not perform this cross-address-family mapping.
+
+```
+Server listener: [::]:9876 (IPv6 transport endpoint)
+Client connect:  127.0.0.1:9876 (IPv4 transport endpoint)
+→ VPP session lookup: no IPv4 listener on port 9876 → "connect failed! no route"
+```
+
+**Fix:** Use `"tcp4"` in both `net.Listen` and `net.Dial` to force AF_INET.
+
+---
+
+### Summary of Session 3 Failed Approaches
+
+| Attempt | Strategy | Why It Failed | Fix |
+|---------|----------|---------------|-----|
+| S3-F1 | Spin-wait read/write on EAGAIN/ENOTCONN | VCL MQ not processed — session state never transitions | Use `ldp.epoll_wait()` as MQ pump |
+| S3-F2 | Pass EINPROGRESS to Go runtime poller | Go's poller uses raw syscalls — can't register VCL fake fds | Handle async connect in Frida hook via `ldp.epoll_wait(EPOLLOUT)` |
+| S3-F3 | IPv4 client ↔ IPv6 server | VPP doesn't map IPv4→IPv6 like Linux kernel does | Use `"tcp4"` in both Go binaries |
