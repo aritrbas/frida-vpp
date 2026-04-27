@@ -6,7 +6,7 @@
 //   ./echo_server
 //
 // Run (with Frida + VCL interception):
-//   VCL_CONFIG=/tmp/server-share/vcl.conf frida ./echo_server -l interceptor_fixed.js
+//   VCL_CONFIG=/tmp/server-share/vcl.conf frida -f ./echo_server -l ../interceptor.js
 //
 // The server listens on 0.0.0.0:9876 and echoes back anything it receives.
 // It logs each syscall-level operation so you can verify Frida intercepts them.

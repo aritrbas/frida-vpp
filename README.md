@@ -15,48 +15,59 @@
 
 This project uses [Frida](https://frida.re/) to dynamically intercept Go's socket-layer syscalls at runtime and redirect them to VCL, bridging the ABI gap.
 
-**Status:** Full end-to-end echo test (client→server→client) working over VPP VCL.
+**Status:** Full end-to-end working — TCP echo and HTTP (client↔server) over VPP VCL.
 
 ## Repository Structure
 
 ```
 frida-vpp/
-├── interceptor_server.js          # Working Frida script for Go server binaries
-├── interceptor_client.js          # Working Frida script for Go client binaries
+├── interceptor.js                 # ★ Unified Frida script — works for ANY Go binary (server or client)
+├── interceptor_server.js          # Earlier server-only script (working, kept for reference)
+├── interceptor_client.js          # Earlier client-only script (working, kept for reference)
 ├── docs/
-│   ├── session2_debugging_report.md  # Sessions 2 & 3: all fixes, flowcharts, root cause analysis
-│   ├── failed_attempt_analysis.md    # All experimental attempts and why they failed
-│   └── abi_analysis.md               # Go ABI vs System V ABI + VCL MQ pump architecture
+│   ├── interceptor_architecture.md   # Full technical design & architecture of interceptor.js
+│   ├── abi_analysis.md               # Go ABI vs System V ABI — deep register & stack analysis
+│   └── debugging.md                  # All failed attempts, debugging sessions, and bug fixes
 ├── test/
-│   ├── echo_server.go             # Sample TCP echo server for testing
-│   ├── echo_client.go             # Sample TCP echo client for testing
+│   ├── echo_server.go             # TCP echo server for testing
+│   ├── echo_client.go             # TCP echo client for testing
+│   ├── http_server.go             # Raw TCP HTTP server for testing
+│   ├── http_client.go             # Raw TCP HTTP client for testing
+│   ├── run_tests.sh               # Automated test runner (both echo and HTTP)
 │   └── README.md                  # Build, run, and test instructions
-└── experiments/                   # All previous experimental attempts (for reference)
+└── experiments/                   # All previous failed attempts (for reference)
     ├── interceptor2.js            # Attempt: Hook libc symbols (fails — Go bypasses libc)
     ├── interceptor3.js            # Attempt: Direct replace Go symbols with LDP (fails — ABI mismatch)
     ├── interceptor4.js            # Attempt: Hook RawSyscall6 (fails — wrong register indexing)
-    ├── interceptor5.js            # Attempt: prepRegs shim v1 (fails — copy-paste bug, no return cleanup)
-    ├── interceptor_full_attempt.js    # Most complete attempt (fails — no rbx/rcx cleanup)
-    ├── interceptor_syscall_level.js   # Syscall/RawSyscall6 level hooks (fails — no redirect)
-    ├── interceptor_server_v1.js       # Server with global flag dispatch (fails — thread-unsafe)
-    ├── interceptor_client_v1.js       # Client with global flag dispatch (fails — thread-unsafe)
+    ├── interceptor_v1.js          # Attempt: prepRegs per-syscall shims (fails — no rbx/rcx cleanup)
+    ├── interceptor_v2.js          # Attempt: Syscall/RawSyscall6 level hooks (fails — no redirect)
+    ├── interceptor_server_v1.js   # Attempt: Server with global flag dispatch (fails — thread-unsafe)
+    ├── interceptor_client_v1.js   # Attempt: Client with global flag dispatch (fails — thread-unsafe)
     ├── prepRegs.asm               # NASM ABI shim (3-arg register shuffle)
-    ├── prepRegs2.asm              # NASM ABI shim (multiple named variants)
-    ├── prepRegs.s                 # Go plan9 assembly approach (can't inject via Frida)
-    ├── wrapper.asm                # Various assembly wrapper experiments
-    └── wrapper.go                 # Go CGo wrapper experiment
+    └── prepRegs2.asm              # NASM ABI shim (multiple named variants)
 ```
+
+### Interceptor Scripts
+
+| Script | Scope | Description |
+|--------|-------|-------------|
+| **`interceptor.js`** | Universal | **Latest and recommended.** Auto-detects Go binary, 17+ syscalls, epoll-based blocking, VCL library auto-resolution, configurable log verbosity. Works for both servers and clients. |
+| `interceptor_server.js` | Server only | Earlier working script. Hardcodes `moduleName = 'echo_server'`. Hooks 11 syscalls. |
+| `interceptor_client.js` | Client only | Earlier working script. Hardcodes `moduleName = 'echo_client'`. Hooks 9 syscalls (no accept/listen). |
+
+All three scripts use the same core architecture (see [How It Works](#how-it-works)). The unified `interceptor.js` supersedes the other two.
 
 ## How It Works
 
-The interceptors (`interceptor_server.js`, `interceptor_client.js`) use this approach:
+The interceptor uses this approach:
 
-1. **Find Go symbols** — `Process.getModuleByName(name).enumerateSymbols()` locates `syscall.socket`, `syscall.bind`, `syscall.read`, `syscall.write`, `syscall.Close`, etc. in the Go binary.
-2. **Replace with `ret` trampoline** — `Interceptor.replace()` swaps each Go function with a dynamically-allocated single-instruction `ret` (no-op).
-3. **Read Go ABI registers in `onEnter`** — Before the trampoline runs, save arguments from Go ABI positions (`rax`, `rbx`, `rcx`, `rdi`, `rsi`).
-4. **Call VCL in `onLeave`** — After the trampoline returns, call the corresponding LDP function with the saved arguments.
-5. **Set Go return convention** — Set `rax=result`, `rbx=0`, `rcx=0` (success) or `rax=-1`, `rbx=err.itab`, `rcx=err.data` (error) using `go:itab.syscall.Errno,error` for arbitrary errno values.
-6. **Conditional VCL loading** — If `VCL_CONFIG` is not set, the script runs in passthrough mode: hooks fire and log calls, but syscalls go to the kernel normally.
+1. **Auto-detect Go binary** — scans loaded modules for Go symbols (`syscall.*`, `runtime.*`).
+2. **Find Go syscall symbols** — `Process.getModuleByName(name).enumerateSymbols()` locates `syscall.socket`, `syscall.bind`, `syscall.read`, `syscall.write`, `syscall.Close`, etc.
+3. **Replace with `ret` trampoline** — `Interceptor.replace()` swaps each Go function with a dynamically-allocated single-instruction `ret` (no-op).
+4. **Read Go ABI registers in `onEnter`** — Before the trampoline runs, save arguments from Go ABI positions (`rax`, `rbx`, `rcx`, `rdi`, `rsi`).
+5. **Call VCL in `onLeave`** — After the trampoline returns, call the corresponding LDP function with the saved arguments.
+6. **Set Go return convention** — Set `rax=result`, `rbx=0`, `rcx=0` (success) or `rax=-1`, `rbx=err.itab`, `rcx=err.data` (error) using `go:itab.syscall.Errno,error` for arbitrary errno values.
+7. **Conditional VCL loading** — If `VCL_CONFIG` is not set, the script runs in passthrough mode (no hooks installed, syscalls go to kernel).
 
 ```
 Go: syscall.socket(domain=2, type=1, proto=0)
@@ -77,92 +88,118 @@ Go: syscall.read(fd=32, buf, len)
   └─ Go sees: n bytes read ✓
 ```
 
-### Why `read`/`write`/`close` must be hooked
+### Why `read`/`write`/`close` Must Be Hooked
 
 LDP assigns fake fd numbers to VCL sessions (`fd = vlsh + 32`). These do not exist as kernel file descriptors. If Go calls the kernel's `read(fd=32, ...)` directly, the kernel returns `EBADF`. Hooking `syscall.read`, `syscall.write`, and `syscall.Close` ensures all I/O goes through LDP, which internally routes based on the fd value:
 - `fd ≥ 32` → VCL session path
 - `fd < 32` → real kernel fd path (libc passthrough)
 
+### Supported Syscalls (17)
+
+`socket`, `bind`, `listen`, `accept4`, `accept`, `connect`, `setsockopt`, `getsockopt`, `getsockname`, `getpeername`, `read`, `write`, `close`, `shutdown`, `fcntl`, `epoll_ctl`, `epoll_wait`
+
+For the full technical architecture, see [docs/interceptor_architecture.md](docs/interceptor_architecture.md).
+
 ## Quick Start
 
+### Build Test Binaries
+
 ```bash
-# Build test binaries (on Linux x86_64 with Go installed)
 cd test/
 go build -o echo_server echo_server.go
 go build -o echo_client echo_client.go
+go build -o http_server http_server.go
+go build -o http_client http_client.go
 cd ..
+```
 
-# Set LD_LIBRARY_PATH so VCL's own dependencies are found
+**Important:** Do NOT use `-ldflags="-s -w"` — Frida needs the Go symbols.
+
+### Set Up Environment
+
+```bash
 export VPP_LIB=/home/aritrbas/vpp/build-root/install-vpp_debug-native/vpp/lib/x86_64-linux-gnu
 export LD_LIBRARY_PATH=$VPP_LIB
+```
 
-# Step 3: Test without VCL — verify hooks fire (no VCL_CONFIG set)
-frida ./test/echo_server -l interceptor_server.js
+### Test Without VCL (Passthrough Mode)
+
+Verify hooks fire correctly before adding VPP to the mix:
+
+```bash
+frida -f ./test/echo_server -l interceptor.js
 # Expected: "[*] VCL_CONFIG not set — passthrough mode"
-# Then connect a client and see hooks log socket/bind/listen/accept4 calls.
+```
 
-# Step 4: Test with VPP/VCL (VPP must be running first)
-# Create vcl.conf files (only needed once):
+### Test With VPP/VCL
+
+VPP must be running first. Create VCL config files (only needed once):
+
+```bash
 mkdir -p /tmp/server-share /tmp/client-share
 printf 'vcl {\n  rx-fifo-size 4000000\n  tx-fifo-size 4000000\n  app-scope-local\n  app-scope-global\n  use-mq-eventfd\n  app-socket-api /run/vpp/app_ns_sockets/default\n}\n' \
   > /tmp/server-share/vcl.conf
 cp /tmp/server-share/vcl.conf /tmp/client-share/vcl.conf
+```
 
+#### Echo (TCP) Test
+
+```bash
 # Terminal 1 — server
-VCL_CONFIG=/tmp/server-share/vcl.conf frida ./test/echo_server -l interceptor_server.js
+VCL_CONFIG=/tmp/server-share/vcl.conf frida -f ./test/echo_server -l interceptor.js
 
-# Terminal 2 — client (one-shot mode avoids Frida REPL stealing stdin)
+# Terminal 2 — client
 VCL_CONFIG=/tmp/client-share/vcl.conf \
-  frida -f ./test/echo_client -l interceptor_client.js \
+  frida -f ./test/echo_client -l interceptor.js \
   -- 127.0.0.1:9876 "hello vcl"
-# Expected output: [client] Echo: hello vcl
+# Expected: [client] Echo: hello vcl
+```
+
+#### HTTP Test
+
+```bash
+# Terminal 1 — server
+VCL_CONFIG=/tmp/server-share/vcl.conf frida -f ./test/http_server -l interceptor.js -- 8080
+
+# Terminal 2 — client
+VCL_CONFIG=/tmp/client-share/vcl.conf \
+  frida -f ./test/http_client -l interceptor.js \
+  -- 127.0.0.1:8080 /
+# Expected: PASS: got HTTP 200 OK
+```
+
+#### Automated Test Runner
+
+```bash
+cd test/
+./run_tests.sh          # run all tests
+./run_tests.sh echo     # echo test only
+./run_tests.sh http     # HTTP test only
 ```
 
 See [test/README.md](test/README.md) for detailed instructions including Docker/HST setup.
 
 ## Key Bugs Fixed
 
-All previous attempts failed due to three fundamental issues, plus additional bugs discovered during sessions 2 and 3. See [docs/session2_debugging_report.md](docs/session2_debugging_report.md) for the full analysis.
-
-### Original Design Bugs (Session 1)
-
-| Bug | Root Cause | Fix |
-|-----|-----------|-----|
-| Go return values corrupted | Only `rax` was set; `rbx`/`rcx` left as garbage from C call | Always set `rbx`/`rcx` using `go:itab.syscall.Errno,error` + heap-allocated errno slots |
-| Thread-unsafe dispatch | Global flag to identify which syscall is active | Per-invocation state via `this._xxx` in Frida's `onEnter` |
-| No assembly shim needed | prepRegs.asm + two-step replace+attach was fragile | Single `ret` trampoline + JS-side register read/write |
-
-### Session 2 Bugs Fixed
+All previous experimental attempts failed and multiple debugging sessions were needed to achieve end-to-end working interception. See [docs/debugging.md](docs/debugging.md) for the full chronological analysis.
 
 | Bug | Symptom | Root Cause | Fix |
 |-----|---------|-----------|-----|
-| accept4 EBADF | "bad file descriptor" from Go's net.Accept | LDP fake fds (≥32) — kernel doesn't know about them; Go tried epoll on fake fd | Make accept4 blocking (spin-wait EAGAIN) to prevent Go's epoll path |
-| read/write EBADF on connected sessions | Connection data transfer silently fails | Same fake fd issue — kernel read/write return EBADF for VCL fds | Hook `syscall.read`, `syscall.write`, `syscall.Close` to route through LDP |
-| MPTCP duplicate listeners | EADDRINUSE on listen() | Go 1.21+ creates proto=262 (IPPROTO_MPTCP) socket in addition to TCP | Reject proto=262 with EPROTONOSUPPORT; Go falls back to TCP |
-| IPv6 dual-stack EADDRINUSE | listen() fails | Go binds `[::]:port` → VPP creates both IPv4 and IPv6 listeners | Set `IPV6_V6ONLY=1` before calling `ldp.listen()` |
-| connect stuck in SO_ERROR loop | Client hangs forever | `VPPCOM_ATTR_GET_ERROR` is a VPP stub returning 0 always | Use `ldp.epoll_wait(EPOLLOUT)` to wait for session READY |
-| connect using ldp.poll blocks JS thread | Frida JS thread frozen indefinitely | `ldp.poll()` is a blocking call; blocks Frida's entire JS event loop | Use `ldp.epoll_wait()` instead (bounded timeout, processes MQ) |
-| findLdpSym returns null | No LDP functions found | After `Module.load()`, Frida registers versioned soname `libvcl_ldpreload.so.26.06` | Search all modules for 'ldpreload' substring |
-| goErrFromErrno nil pointer panic | Go crashes in error.Error() | `syscall.Errno` has pointer receivers — data word must be `*Errno`, not inline `Errno` | Allocate 8-byte slot per errno value; use slot address as data pointer |
-
-### Session 3 Bugs Fixed
-
-| Bug | Symptom | Root Cause | Fix |
-|-----|---------|-----------|-----|
-| VCL MQ starvation | write returns ENOTCONN, read returns EAGAIN forever | `vppcom_session_write/read` don't process VCL message queue; SESSION_CONNECTED event stuck unread | Use `ldp.epoll_wait()` as MQ pump (routes through `vppcom_epoll_wait` which drains MQ) |
-| IPv4/IPv6 mismatch | "connect failed! no route" from VPP | Go's `net.Listen("tcp")` creates AF_INET6 socket; VPP can't match IPv4 connect to IPv6 listener | Use `"tcp4"` in both Go binaries to force AF_INET |
-| Go runtime poller bypass | EINPROGRESS passthrough causes getsockopt spam loop | Go's runtime poller uses raw syscalls (not libc) → can't register VCL fake fds with kernel epoll | Handle all async connect in Frida hooks via `ldp.epoll_wait(EPOLLOUT)` |
-
-### Frida 17 API Compatibility Fixes
-
-| Broken API (Frida ≤16) | Replacement (Frida 17) |
-|------------------------|------------------------|
-| `Module.enumerateSymbols(name, {onMatch, onComplete})` | `Process.getModuleByName(name).enumerateSymbols()` (returns array) |
-| `Process.enumerateModules({onMatch, onComplete})` | `Process.enumerateModules()` (returns array) |
-| `Module.findExportByName(modName, sym)` static form | `findExport()` helper using `Process.findModuleByName(mod).findExportByName(sym)` |
-| `Process.getEnvironmentVariable(name)` | `getenv()` via `NativeFunction` calling libc's `getenv` |
-| `--no-pause` CLI flag | Removed in Frida 17 (auto-resume is now the default) |
-| `Module.findExportByName(null, sym)` at spawn time | Must specify module name explicitly (e.g., `'libc.so.6'`) |
+| Go return values corrupted | Successful VCL calls reported as errors | Only `rax` set; `rbx`/`rcx` left as garbage from C call | Always set `rbx`/`rcx` using `go:itab.syscall.Errno,error` + heap-allocated errno slots |
+| Thread-unsafe dispatch | Wrong LDP function called under concurrency | Global flag to identify active syscall; goroutines race on it | Per-invocation state via `this._` in Frida's `onEnter` |
+| Assembly shim fragility | Stack corruption, return value undefined | prepRegs.asm + two-step replace+attach | Single `ret` trampoline + JS-side register read/write |
+| accept4 EBADF | "bad file descriptor" from Go Accept | LDP fake fds (≥32); Go tried kernel epoll on fake fd | Make accept4 blocking (spin-wait EAGAIN) |
+| read/write EBADF | Data transfer fails silently | Kernel read/write on VCL fake fds → EBADF | Hook `syscall.read`, `write`, `Close` → route through LDP |
+| MPTCP duplicate listeners | EADDRINUSE on listen() | Go 1.21+ creates proto=262 (MPTCP) + regular TCP socket | Reject proto=262 with EPROTONOSUPPORT |
+| IPv6 dual-stack EADDRINUSE | listen() fails | VPP creates IPv4+IPv6 companion listeners | Set `IPV6_V6ONLY=1` before `ldp.listen()` on IPv6 sockets |
+| connect stuck forever | Client hangs | `VPPCOM_ATTR_GET_ERROR` is a VPP stub (always returns 0); `ldp.poll` blocks JS thread | Use `ldp.epoll_wait(EPOLLOUT)` to wait for session READY |
+| VCL MQ starvation | write ENOTCONN, read EAGAIN forever | `vppcom_session_write/read` don't process MQ; SESSION_CONNECTED unread | Use `ldp.epoll_wait()` as MQ pump |
+| IPv4/IPv6 mismatch | "no route" from VPP connect | VPP doesn't cross-match IPv4 connect → IPv6 listener | Use `"tcp4"` in Go binaries |
+| Go runtime poller bypass | getsockopt(SO_ERROR) spam at 100% CPU | Go's poller uses raw syscalls — can't register VCL fake fds with kernel epoll | Handle async connect entirely in Frida hook |
+| goErrFromErrno panic | nil pointer dereference in Go error formatting | `syscall.Errno` has pointer receivers — data must be `*Errno`, not inline value | Allocate 8-byte heap slot per errno |
+| findLdpSym returns null | No LDP functions resolved | Module registered under versioned soname `.so.26.06` | Search modules for 'ldpreload' substring |
+| Goroutine stack overflow | SIGSEGV in stackpoolalloc | epoll NativeFunction calls overflow 8KB goroutine stack | Use spin-wait for accept/server-side goroutines |
+| Frida 17 API breakage | Hooks silently not installed | `Module.enumerateSymbols()` callback form removed; `findExportByName` static form removed; `getEnvironmentVariable` removed | Use array-returning APIs; `findExport()` helper; libc `getenv()` via NativeFunction |
 
 ## Requirements
 

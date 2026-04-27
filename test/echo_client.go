@@ -7,7 +7,7 @@
 //   ./echo_client localhost:9876
 //
 // Run (with Frida + VCL interception):
-//   VCL_CONFIG=/tmp/client-share/vcl.conf frida ./echo_client -l interceptor_fixed_client.js
+//   VCL_CONFIG=/tmp/client-share/vcl.conf frida -f ./echo_client -l ../interceptor.js
 //
 // The client connects to the echo server, sends messages, and prints responses.
 // It triggers: syscall.socket, syscall.connect, syscall.getsockopt

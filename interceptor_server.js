@@ -5,7 +5,7 @@
  * accept4, connect, setsockopt, getsockopt, getsockname) and redirects them
  * to VPP's VCL library (libvcl_ldpreload.so).
  *
- * KEY FIXES over previous attempts (see docs/failed_attempt_analysis.md):
+ * KEY FIXES over previous attempts (see docs/debugging.md):
  *   1. Uses NativeCallback (not prepRegs shim) — performs Go ABI → System V ABI
  *      register translation entirely in Frida JS, eliminating the two-step
  *      replace+attach approach.

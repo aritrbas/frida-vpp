@@ -449,7 +449,7 @@ Required return    0      0       0       ?      ?      ?      ?     ?     ?
 | Go ABI args in `rax,rbx,rcx` vs System V `rdi,rsi,rdx` | C functions receive garbage arguments | `experiments/interceptor3.js`, all replace-with-LDP attempts |
 | Go returns `(rax, rbx, rcx)` not just `rax` | Go misinterprets successful calls as errors | ALL experiment interceptor files |
 | Global mutable state for call dispatch | Race conditions under concurrent goroutines | `experiments/interceptor_server_v1.js`, `experiments/interceptor_client_v1.js` |
-| Blocking `accept4` in Frida JS thread | Frida event loop freezes | `experiments/interceptor_full_attempt.js`, `experiments/interceptor_server_v1.js` |
+| Blocking `accept4` in Frida JS thread | Frida event loop freezes | `experiments/interceptor_v1.js`, `experiments/interceptor_server_v1.js` |
 | `prepRegs` only shuffles, doesn't call LDP | Two-step approach leaves return value undefined | All prepRegs-based approaches |
 
 ---
@@ -543,7 +543,7 @@ When Go calls `err.Error()`, it dereferences the data pointer as `*Errno`. If da
 Frida 17 auto-resumes the target by default. All run commands should omit `--no-pause`:
 ```bash
 # Frida 17+
-frida ./test/echo_server -l interceptor_server.js
+frida -f ./test/echo_server -l interceptor.js
 ```
 
 ---
